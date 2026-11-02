@@ -9,14 +9,20 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use beacon_plugin_sdk::datafusion::arrow::datatypes::SchemaRef;
 use beacon_plugin_sdk::datafusion::catalog::{Session, TableProvider, TableProviderFactory};
-use beacon_plugin_sdk::datafusion::common::{Result, not_impl_err, plan_datafusion_err, plan_err};
+use beacon_plugin_sdk::datafusion::common::{Result, plan_datafusion_err, plan_err};
 use beacon_plugin_sdk::datafusion::datasource::TableType as DfTableType;
 use beacon_plugin_sdk::datafusion::logical_expr::{CreateExternalTable, Expr};
+use beacon_plugin_sdk::datafusion::physical_expr::LexOrdering;
 use beacon_plugin_sdk::datafusion::physical_plan::ExecutionPlan;
+use beacon_plugin_sdk::datafusion::physical_plan::streaming::{
+    PartitionStream, StreamingTableExec,
+};
 use beacon_plugin_sdk::table_type::{TableType, table_option};
 use lance::Dataset;
+use lance::table::format::Fragment;
 
 use crate::schema::{Column, columns, table_schema};
+use crate::stream::LanceNdPartition;
 
 /// The option key for the number of scan partitions.
 const PARTITIONS: &str = "partitions";
@@ -85,14 +91,58 @@ impl TableProvider for LanceNdTable {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
-        _projection: Option<&Vec<usize>>,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
         _filters: &[Expr],
-        _limit: Option<usize>,
+        limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let _ = (&self.columns, self.partitions);
-        not_impl_err!("lance_nd scan")
+        let uri = &self.uri;
+        let dataset = Dataset::open(uri)
+            .await
+            .map_err(|e| plan_datafusion_err!("lance_nd: cannot open `{uri}`: {e}"))?;
+        let dataset = Arc::new(dataset);
+        let (schema, columns): (SchemaRef, Arc<[Column]>) = match projection {
+            Some(indices) => (
+                Arc::new(self.schema.project(indices)?),
+                indices.iter().map(|i| self.columns[*i].clone()).collect(),
+            ),
+            None => (Arc::clone(&self.schema), Arc::clone(&self.columns)),
+        };
+        let count = self
+            .partitions
+            .unwrap_or_else(|| state.config().target_partitions());
+        let partitions = fragment_groups(dataset.fragments(), count)
+            .into_iter()
+            .map(|fragments| {
+                Arc::new(LanceNdPartition {
+                    dataset: Arc::clone(&dataset),
+                    fragments,
+                    filter: None,
+                    schema: Arc::clone(&schema),
+                    columns: Arc::clone(&columns),
+                }) as Arc<dyn PartitionStream>
+            })
+            .collect();
+        let exec = StreamingTableExec::try_new(
+            schema,
+            partitions,
+            None,
+            Vec::<LexOrdering>::new(),
+            false,
+            limit,
+        )?;
+        Ok(Arc::new(exec))
     }
+}
+
+/// `fragments` round robin over at most `count` groups. Always at least one group.
+fn fragment_groups(fragments: &[Fragment], count: usize) -> Vec<Vec<Fragment>> {
+    let mut groups = vec![Vec::new(); count.min(fragments.len()).max(1)];
+    let len = groups.len();
+    for (index, fragment) in fragments.iter().enumerate() {
+        groups[index % len].push(fragment.clone());
+    }
+    groups
 }
 
 /// Returns every table type of the plugin.
@@ -102,7 +152,9 @@ pub fn tables() -> Vec<TableType> {
 
 #[cfg(test)]
 mod tests {
-    use beacon_plugin_sdk::datafusion::arrow::datatypes::DataType;
+    use beacon_plugin_sdk::datafusion::arrow::array::AsArray;
+    use beacon_plugin_sdk::datafusion::arrow::datatypes::{DataType, Float64Type};
+    use beacon_plugin_sdk::datafusion::prelude::SessionContext;
 
     use crate::fixture::{field_type, session, write_fixture};
 
@@ -159,5 +211,72 @@ mod tests {
         );
         let error = create(&sql).await;
         assert!(error.contains("must be 1 to 512"), "{error}");
+    }
+
+    /// A session with table `t` over the fixture, with `options` as the OPTIONS clause.
+    async fn table(dir: &tempfile::TempDir, options: &str) -> SessionContext {
+        let uri = write_fixture(dir.path()).await;
+        let ctx = session();
+        let sql = format!("CREATE EXTERNAL TABLE t STORED AS lance_nd LOCATION '{uri}' {options}");
+        ctx.sql(&sql).await.unwrap();
+        ctx
+    }
+
+    async fn rows(ctx: &SessionContext, sql: &str) -> usize {
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        batches.iter().map(|b| b.num_rows()).sum()
+    }
+
+    async fn number(ctx: &SessionContext, sql: &str) -> f64 {
+        let sql = format!("SELECT CAST(({sql}) AS DOUBLE)");
+        let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+        batches[0].column(0).as_primitive::<Float64Type>().value(0)
+    }
+
+    #[tokio::test]
+    async fn count_star_counts_cells() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = table(&dir, "").await;
+        assert_eq!(number(&ctx, "SELECT count(*) FROM t").await, 23.0);
+    }
+
+    #[tokio::test]
+    async fn projection_keeps_the_full_grid() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = table(&dir, "").await;
+        assert_eq!(rows(&ctx, "SELECT x FROM t WHERE id = 'a'").await, 12);
+    }
+
+    #[tokio::test]
+    async fn filter_on_a_variable() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = table(&dir, "").await;
+        let sql = "SELECT count(*) FROM t WHERE temperature >= 100";
+        assert_eq!(number(&ctx, sql).await, 8.0);
+    }
+
+    #[tokio::test]
+    async fn sum_over_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = table(&dir, "").await;
+        assert_eq!(number(&ctx, "SELECT sum(pressure) FROM t").await, 6.0);
+    }
+
+    #[tokio::test]
+    async fn limit_stops_early() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = table(&dir, "").await;
+        assert_eq!(rows(&ctx, "SELECT * FROM t LIMIT 5").await, 5);
+    }
+
+    #[tokio::test]
+    async fn partitions_give_the_same_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = table(&dir, "OPTIONS ('partitions' '4')").await;
+        assert_eq!(number(&ctx, "SELECT count(*) FROM t").await, 23.0);
+        assert_eq!(
+            number(&ctx, "SELECT sum(temperature) FROM t").await,
+            66.0 + 828.0
+        );
     }
 }

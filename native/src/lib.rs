@@ -4,6 +4,7 @@
 mod fixture;
 mod flatten;
 mod schema;
+mod stream;
 mod table;
 
 beacon_plugin_sdk::export_plugin!(tables = table::tables);
