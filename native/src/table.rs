@@ -55,7 +55,7 @@ impl TableProviderFactory for LanceNdFactory {
         let dataset = Dataset::open(&uri)
             .await
             .map_err(|e| plan_datafusion_err!("lance_nd: cannot open `{uri}`: {e}"))?;
-        let schema = table_schema(&dataset)?;
+        let schema = table_schema(&dataset).map_err(|e| e.context(format!("table `{uri}`")))?;
         let columns = columns(&schema, &dataset).into();
         Ok(Arc::new(LanceNdTable {
             uri,
@@ -178,13 +178,16 @@ pub fn tables() -> Vec<TableType> {
 
 #[cfg(test)]
 mod tests {
-    use beacon_plugin_sdk::datafusion::arrow::array::AsArray;
-    use beacon_plugin_sdk::datafusion::arrow::datatypes::{DataType, Float64Type};
+    use beacon_plugin_sdk::datafusion::arrow::array::{
+        AsArray, Int32Array, RecordBatch, RecordBatchIterator,
+    };
+    use beacon_plugin_sdk::datafusion::arrow::datatypes::{DataType, Field, Float64Type, Schema};
     use beacon_plugin_sdk::datafusion::prelude::SessionContext;
+    use nd_arrow_array::Attributes;
 
     use super::*;
 
-    use crate::fixture::{field_type, session, write_fixture};
+    use crate::fixture::{field_type, row0, session, write_fixture, write_rows};
 
     async fn create(sql: &str) -> String {
         let ctx = session();
@@ -322,10 +325,7 @@ mod tests {
             .await
             .unwrap();
         let shown = scan_partitions(&plan);
-        assert!(
-            shown.contains("__global_attrs__.id = 'c'"),
-            "{shown}"
-        );
+        assert!(shown.contains("__global_attrs__.id = 'c'"), "{shown}");
     }
 
     /// The Debug text of the partitions of the first `StreamingTableExec` in `plan`.
@@ -334,5 +334,31 @@ mod tests {
             return format!("{:?}", exec.partitions());
         }
         plan.children().into_iter().map(scan_partitions).collect()
+    }
+
+    #[tokio::test]
+    async fn keyword_attribute_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let attributes = Attributes::new().with("id", "a").with("null", "k");
+        let uri = write_rows(dir.path(), vec![row0().with_attributes(attributes)]).await;
+        let ctx = session();
+        let sql = format!("CREATE EXTERNAL TABLE t STORED AS lance_nd LOCATION '{uri}'");
+        ctx.sql(&sql).await.unwrap();
+        let sql = r#"SELECT count(*) FROM t WHERE "null" = 'k'"#;
+        assert_eq!(number(&ctx, sql).await, 12.0);
+    }
+
+    #[tokio::test]
+    async fn non_nd_table_error_names_the_uri() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("plain.lance").to_str().unwrap().to_string();
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+            .unwrap();
+        let reader = RecordBatchIterator::new([Ok(batch)], schema);
+        Dataset::write(reader, &uri, None).await.unwrap();
+        let sql = format!("CREATE EXTERNAL TABLE t STORED AS lance_nd LOCATION '{uri}'");
+        let error = create(&sql).await;
+        assert!(error.contains("plain.lance"), "{error}");
     }
 }

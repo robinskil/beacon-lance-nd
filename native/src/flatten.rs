@@ -5,7 +5,7 @@ use beacon_plugin_sdk::datafusion::arrow::array::{
 };
 use beacon_plugin_sdk::datafusion::arrow::compute::cast;
 use beacon_plugin_sdk::datafusion::arrow::datatypes::{Field, SchemaRef};
-use beacon_plugin_sdk::datafusion::common::{DataFusionError, Result, ScalarValue};
+use beacon_plugin_sdk::datafusion::common::{DataFusionError, Result, ScalarValue, exec_err};
 use nd_arrow_array::NdRecordBatch;
 
 use crate::schema::Column;
@@ -18,7 +18,12 @@ pub fn flatten(
     columns: &[Column],
     batch_size: usize,
 ) -> Result<Vec<RecordBatch>> {
-    let cells = row.target().num_elements();
+    let Some(cells) = row.target().checked_num_elements() else {
+        return exec_err!(
+            "lance_nd: the grid of a row is too large: {:?}",
+            row.target().shape()
+        );
+    };
     let arrays = schema
         .fields()
         .iter()
@@ -189,5 +194,29 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(id.value(0), "z");
+    }
+
+    #[test]
+    fn grid_overflow_is_an_error() {
+        let size = 1 << 16;
+        let names = ["a", "b", "c", "d"];
+        let arrays: Vec<_> = names
+            .iter()
+            .map(|name| {
+                let values = Arc::new(Float32Array::from(vec![0.0; size]));
+                let dims = nd_arrow_array::Dimensions::try_new([(*name, size)]).unwrap();
+                nd_arrow_array::NdArrowArray::try_new(values, dims).unwrap()
+            })
+            .collect();
+        let fields: Vec<Field> = names
+            .iter()
+            .map(|name| Field::new(*name, DataType::Float32, true))
+            .collect();
+        let row = NdRecordBatch::try_new_inferred(Arc::new(Schema::new(fields)), arrays).unwrap();
+        let (schema, columns) = projection(&[]);
+        let error = flatten(&row, &schema, &columns, 8192)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("too large"), "{error}");
     }
 }

@@ -47,6 +47,7 @@ Rules:
 A filter on global attribute columns goes to Lance. Lance then reads only the rows that match.
 These filters go to Lance: `=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, `IN`, `IS NULL` and `IS NOT NULL`, with string, number and boolean values.
 Beacon applies all filters again on the flat rows. Other filters, for example on variables, run in Beacon only.
+A filter on an attribute key named `true`, `false` or `null` also runs in Beacon only.
 
 ### Options
 

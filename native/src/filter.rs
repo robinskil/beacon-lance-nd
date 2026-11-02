@@ -59,8 +59,10 @@ fn attribute_of(expr: &Expr, columns: &[Column]) -> Option<String> {
 fn attribute(name: &str, columns: &[Column]) -> Option<String> {
     let plain = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    // Lance reads these names as literals, not as fields.
+    let keyword = ["true", "false", "null"].contains(&name.to_ascii_lowercase().as_str());
     let known = columns.contains(&Column::Attribute(name.to_string()));
-    (plain && known).then(|| format!("{GLOBAL_ATTRIBUTES_FIELD}.{name}"))
+    (plain && !keyword && known).then(|| format!("{GLOBAL_ATTRIBUTES_FIELD}.{name}"))
 }
 
 /// The Lance SQL text of a literal, or `None` for a null or an unsupported type.
@@ -140,5 +142,18 @@ mod tests {
     fn null_checks_and_not() {
         let text = lance(!col("id").is_null());
         assert_eq!(text.as_deref(), Some("NOT (__global_attrs__.id IS NULL)"));
+    }
+
+    #[test]
+    fn literal_keyword_names_are_not_pushed() {
+        use beacon_plugin_sdk::datafusion::common::Column as DfColumn;
+        let columns = vec![
+            Column::Attribute("null".into()),
+            Column::Attribute("True".into()),
+        ];
+        for name in ["null", "True"] {
+            let expr = Expr::Column(DfColumn::from_name(name)).eq(lit("k"));
+            assert_eq!(to_lance(&expr, &columns), None, "{name}");
+        }
     }
 }
