@@ -2,6 +2,7 @@
 
 #[cfg(test)]
 mod fixture;
+mod flatten;
 mod schema;
 mod table;
 
