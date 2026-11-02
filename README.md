@@ -1,121 +1,83 @@
-# beacon-plugin-template
+# beacon-lance-nd
 
-An example plugin for [Beacon](https://github.com/maris-development/beacon), and a template to make your own.
-The [wiki](https://github.com/maris-development/beacon-plugin-template/wiki) is the full guide.
-
-## What a plugin can do
-
-| A plugin adds | Example in this template | More information |
-| --- | --- | --- |
-| Native SQL functions, written in Rust | `example_add_one`, `example_hypot`, `example_in_box`, `example_round` | [Scalar functions](https://github.com/maris-development/beacon-plugin-template/wiki/Scalar-Functions) |
-| SQL functions, written in SQL | `example_add_two` | [Scalar functions](https://github.com/maris-development/beacon-plugin-template/wiki/Scalar-Functions#sql-functions) |
-| Planner hooks, so a filter on a function prunes files | `example_add_one`, `example_in_box` | [Planner hooks](https://github.com/maris-development/beacon-plugin-template/wiki/Planner-Hooks) |
-| File formats, so Beacon reads and writes a new type of file | `example_tsv` | [File formats](https://github.com/maris-development/beacon-plugin-template/wiki/File-Formats) |
-| Table types, so a table reads from and writes to another system | `example_memory` | [Table types](https://github.com/maris-development/beacon-plugin-template/wiki/Table-Types) |
+A [Beacon](https://github.com/maris-development/beacon) plugin that reads [lance-nd](https://github.com/robinskil/lance-nd) tables.
+The plugin adds the table type `lance_nd`.
+Beacon reads each lance-nd row as flat rows: one flat row for each cell of the row grid.
 
 ## Install the plugin
 
 An admin installs the plugin from a GitHub release:
 
 ```sql
-INSTALL example FROM 'github:<owner>/<repo>@v0.1.0'
+INSTALL lance_nd FROM 'github:robinskil/beacon-lance-nd@v0.1.0'
 ```
 
-Beacon downloads the archive for its own platform, checks it against `SHA256SUMS` and loads it.
-`BEACON_PLUGINS=example=github:<owner>/<repo>@v0.1.0` installs the plugin at server start.
-`SELECT * FROM beacon.system.plugins` shows the installed plugins. `UNINSTALL example` removes the plugin.
+`BEACON_PLUGINS=lance_nd=github:robinskil/beacon-lance-nd@v0.1.0` installs the plugin at server start.
+`SELECT * FROM beacon.system.plugins` shows the installed plugins. `UNINSTALL lance_nd` removes the plugin.
 
-More information: [Installing](https://github.com/maris-development/beacon-plugin-template/wiki/Installing).
-
-## Use the plugin
-
-| Function | Result |
-| --- | --- |
-| `example_add_one(x)`, alias `example_inc(x)` | `x + 1` |
-| `example_add_two(x)` | `x + 2` |
-| `example_hypot(x, y)` | `sqrt(x² + y²)` |
-| `example_in_box(lon, lat, min_lon, min_lat, max_lon, max_lat)` | `true` when the point is in the box |
-| `example_round(x, digits)` | `x` rounded to `digits` decimals. `digits` must be a constant. |
+## Read a lance-nd table
 
 ```sql
-SELECT example_hypot(3.0, 4.0), example_round(3.14159, 2);
+CREATE EXTERNAL TABLE obs STORED AS lance_nd LOCATION '/data/obs.lance';
+SELECT time, lat, sst FROM obs WHERE id = 'a' AND sst > 290;
 ```
 
-The file format `example_tsv` reads and writes tab-separated text files with the extension `.tsv`:
+`LOCATION` is the path of the lance-nd table, or a `file://` URI.
+A relative path is relative to the working directory of the Beacon server.
 
-```sql
-SELECT * FROM read_example_tsv(['stations.tsv'], {null_value: '-'});
-CREATE EXTERNAL TABLE stations STORED AS example_tsv LOCATION 'tsv/' OPTIONS ('null_value' '-');
-COPY (SELECT * FROM stations) TO 'result.tsv' STORED AS example_tsv;
-```
+### Columns
 
-The table type `example_memory` keeps rows in memory until the server stops:
+The plugin reads the columns from the table. Do not give a column list.
 
-```sql
-CREATE EXTERNAL TABLE notes (id BIGINT, note VARCHAR) STORED AS example_memory LOCATION 'memory';
-INSERT INTO notes VALUES (1, 'first');
-SELECT * FROM notes;
-```
-
-## How a plugin works
-
-A plugin is an archive with three parts:
-
-| Part | File | Contents |
+| Column | Source | Value on each flat row |
 | --- | --- | --- |
-| Manifest | `beacon-plugin.toml` | The name, the version and the supported Beacon versions. |
-| Native library | `native/` | A Rust crate on `beacon-plugin-sdk`. It exports the native functions, the file formats and the table types. |
-| SQL files | `sql/functions.sql` | `CREATE FUNCTION` statements. |
+| One column for each variable | The `nd_arrow.array` columns of the table | The value of the variable at the cell. |
+| One column for each global attribute key | The children of `__global_attrs__` | The value of the attribute. The value is the same on all flat rows of one lance-nd row. |
 
-Beacon loads the library and checks its SDK ABI and DataFusion version.
-So build the plugin with the SDK of the Beacon version that runs it.
+Rules:
 
-More information: [Getting started](https://github.com/maris-development/beacon-plugin-template/wiki/Getting-Started).
+- The grid of a lance-nd row comes from all variables of that row. The column list of a query does not change the grid, so `SELECT x` and `SELECT x, sst` give the same number of rows.
+- A variable that a row does not have is null on all flat rows of that row.
+- A row without variables gives one flat row.
+- `CREATE` fails when a global attribute key has the same name as a variable.
+- The plugin does not read `__stats__` or the attributes of each variable.
 
-## Implement a plugin
+### Filters
 
-1. Click **Use this template** on GitHub. Clone the new repository.
-2. Rename the plugin in `beacon-plugin.toml`, `native/Cargo.toml` and the code. See [Getting started](https://github.com/maris-development/beacon-plugin-template/wiki/Getting-Started#rename-the-plugin).
-3. Write the functions in `native/src/lib.rs`. See [Scalar functions](https://github.com/maris-development/beacon-plugin-template/wiki/Scalar-Functions) and [Planner hooks](https://github.com/maris-development/beacon-plugin-template/wiki/Planner-Hooks).
+A filter on global attribute columns goes to Lance. Lance then reads only the rows that match.
+These filters go to Lance: `=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, `IN`, `IS NULL` and `IS NOT NULL`, with string, number and boolean values.
+Beacon applies all filters again on the flat rows. Other filters, for example on variables, run in Beacon only.
 
-   ```rust
-   function("example_add_one")
-       .args([DataType::Float64])
-       .returns(DataType::Float64)
-       .invoke_arrays(|arrays| { /* compute one value per row */ })
-   ```
+### Options
 
-4. Write the file formats in `native/src/tsv.rs`, or remove it. See [File formats](https://github.com/maris-development/beacon-plugin-template/wiki/File-Formats).
+| Option | Default | Description |
+| --- | --- | --- |
+| `partitions` | The `target_partitions` of the session | The number of scan partitions, from 1 to 512. The plugin divides the Lance fragments between the partitions. |
 
-   ```rust
-   impl FormatFactory for TsvFormat { /* name, extensions, create */ }
-   impl FormatReader for TsvReader { /* infer_schema, open, write */ }
-   ```
+```sql
+CREATE EXTERNAL TABLE obs STORED AS lance_nd LOCATION '/data/obs.lance' OPTIONS ('partitions' '8');
+```
 
-5. Write the table types in `native/src/memory.rs`, or remove it. See [Table types](https://github.com/maris-development/beacon-plugin-template/wiki/Table-Types).
+### Table versions
 
-   ```rust
-   impl TableProviderFactory for MemoryFactory { /* create */ }
-   ```
+Each query reads the latest version of the table.
+`CREATE` reads the columns one time. To see new variables or attribute keys, use `DROP TABLE` and `CREATE` again.
 
-6. Export all of them in `native/src/lib.rs`. Remove the keys that you do not use:
+## Limits
 
-   ```rust
-   beacon_plugin_sdk::export_plugin!(scalar = functions, formats = tsv::formats, tables = memory::tables);
-   ```
+- The plugin reads lance-nd tables. It does not write them. `INSERT INTO` and `COPY TO` are not available.
+- The plugin reads local files only. Cloud object stores are not available.
+- The plugin keeps one full lance-nd row in memory after it flattens the row. Large rows need much memory.
+- A query reads all variables of a row to find its grid, also when the query uses fewer columns.
 
-7. Write the SQL functions in `sql/functions.sql`, or remove `[sql]` from the manifest.
-8. Run the unit tests. See [Testing](https://github.com/maris-development/beacon-plugin-template/wiki/Testing).
+## Build and test
 
-   ```bash
-   cargo test --manifest-path native/Cargo.toml
-   ```
+```bash
+cargo test --manifest-path native/Cargo.toml
+```
 
-9. Set `plugin.version` in `beacon-plugin.toml`, commit and push a tag `v<version>`.
-   The release workflow builds the archives for Linux, macOS and Windows.
-   See [Packaging and releasing](https://github.com/maris-development/beacon-plugin-template/wiki/Packaging-and-Releasing).
-
-An error? See [Troubleshooting](https://github.com/maris-development/beacon-plugin-template/wiki/Troubleshooting).
+To release, set `plugin.version` in `beacon-plugin.toml`, commit and push a tag `v<version>`.
+The release workflow builds the archives for Linux, macOS and Windows.
 
 ## License
 
