@@ -1,5 +1,6 @@
 //! Beacon plugin with the table type `lance_nd`: it reads a lance-nd table as flat rows.
 
+mod filter;
 #[cfg(test)]
 mod fixture;
 mod flatten;

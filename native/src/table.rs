@@ -11,7 +11,9 @@ use beacon_plugin_sdk::datafusion::arrow::datatypes::SchemaRef;
 use beacon_plugin_sdk::datafusion::catalog::{Session, TableProvider, TableProviderFactory};
 use beacon_plugin_sdk::datafusion::common::{Result, plan_datafusion_err, plan_err};
 use beacon_plugin_sdk::datafusion::datasource::TableType as DfTableType;
-use beacon_plugin_sdk::datafusion::logical_expr::{CreateExternalTable, Expr};
+use beacon_plugin_sdk::datafusion::logical_expr::{
+    CreateExternalTable, Expr, TableProviderFilterPushDown,
+};
 use beacon_plugin_sdk::datafusion::physical_expr::LexOrdering;
 use beacon_plugin_sdk::datafusion::physical_plan::ExecutionPlan;
 use beacon_plugin_sdk::datafusion::physical_plan::streaming::{
@@ -21,6 +23,7 @@ use beacon_plugin_sdk::table_type::{TableType, table_option};
 use lance::Dataset;
 use lance::table::format::Fragment;
 
+use crate::filter::to_lance;
 use crate::schema::{Column, columns, table_schema};
 use crate::stream::LanceNdPartition;
 
@@ -89,11 +92,25 @@ impl TableProvider for LanceNdTable {
         DfTableType::Base
     }
 
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>> {
+        // DataFusion applies each filter again, so Lance may keep extra rows.
+        Ok(filters
+            .iter()
+            .map(|f| match to_lance(f, &self.columns) {
+                Some(_) => TableProviderFilterPushDown::Inexact,
+                None => TableProviderFilterPushDown::Unsupported,
+            })
+            .collect())
+    }
+
     async fn scan(
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let uri = &self.uri;
@@ -108,6 +125,15 @@ impl TableProvider for LanceNdTable {
             ),
             None => (Arc::clone(&self.schema), Arc::clone(&self.columns)),
         };
+        let pushed: Vec<String> = filters
+            .iter()
+            .filter_map(|f| to_lance(f, &self.columns))
+            .collect();
+        let filter = match pushed.len() {
+            0 => None,
+            1 => pushed.into_iter().next(),
+            _ => Some(format!("({})", pushed.join(") AND ("))),
+        };
         let count = self
             .partitions
             .unwrap_or_else(|| state.config().target_partitions());
@@ -117,7 +143,7 @@ impl TableProvider for LanceNdTable {
                 Arc::new(LanceNdPartition {
                     dataset: Arc::clone(&dataset),
                     fragments,
-                    filter: None,
+                    filter: filter.clone(),
                     schema: Arc::clone(&schema),
                     columns: Arc::clone(&columns),
                 }) as Arc<dyn PartitionStream>
@@ -155,6 +181,8 @@ mod tests {
     use beacon_plugin_sdk::datafusion::arrow::array::AsArray;
     use beacon_plugin_sdk::datafusion::arrow::datatypes::{DataType, Float64Type};
     use beacon_plugin_sdk::datafusion::prelude::SessionContext;
+
+    use super::*;
 
     use crate::fixture::{field_type, session, write_fixture};
 
@@ -278,5 +306,33 @@ mod tests {
             number(&ctx, "SELECT sum(temperature) FROM t").await,
             66.0 + 828.0
         );
+    }
+
+    #[tokio::test]
+    async fn pushed_filter_gives_the_same_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = table(&dir, "").await;
+        let sql = "SELECT count(*) FROM t WHERE id IN ('a', 'c')";
+        assert_eq!(number(&ctx, sql).await, 20.0);
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let shown = scan_partitions(&plan);
+        assert!(
+            shown.contains("__global_attrs__.id = 'c'"),
+            "{shown}"
+        );
+    }
+
+    /// The Debug text of the partitions of the first `StreamingTableExec` in `plan`.
+    fn scan_partitions(plan: &Arc<dyn ExecutionPlan>) -> String {
+        if let Some(exec) = plan.downcast_ref::<StreamingTableExec>() {
+            return format!("{:?}", exec.partitions());
+        }
+        plan.children().into_iter().map(scan_partitions).collect()
     }
 }
