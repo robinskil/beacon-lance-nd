@@ -22,8 +22,65 @@ CREATE EXTERNAL TABLE obs STORED AS lance_nd LOCATION '/data/obs.lance';
 SELECT time, lat, sst, "sst.units" FROM obs WHERE ".id" = 'a' AND sst > 290;
 ```
 
-`LOCATION` is the path of the lance-nd table, or a `file://` URI.
-A relative path is relative to the working directory of the Beacon server.
+### Locations
+
+`LOCATION` is the URI of the lance-nd table.
+
+| Store | `LOCATION` |
+| --- | --- |
+| Local disk | `/data/obs.lance` or `file:///data/obs.lance`. A relative path is relative to the working directory of the Beacon server. |
+| Amazon S3, or a store that is compatible with S3, such as MinIO | `s3://bucket/path/obs.lance` |
+| Azure Blob Storage | `az://container/path/obs.lance` |
+| Google Cloud Storage | `gs://bucket/path/obs.lance` |
+
+Each `OPTIONS` key, except `partitions`, goes to Lance as a storage option.
+If a key is not in `OPTIONS`, Lance reads it from the environment variables of the Beacon server: `AWS_*`, `AZURE_*` and `GOOGLE_*`.
+Use environment variables for secrets. Then the keys are not in the SQL text.
+
+Amazon S3, with the credentials in the environment:
+
+```sql
+CREATE EXTERNAL TABLE obs STORED AS lance_nd LOCATION 's3://my-bucket/obs.lance'
+OPTIONS ('aws_region' 'eu-west-1');
+```
+
+MinIO, or another store that is compatible with S3:
+
+```sql
+CREATE EXTERNAL TABLE obs STORED AS lance_nd LOCATION 's3://my-bucket/obs.lance'
+OPTIONS (
+  'aws_endpoint' 'http://minio:9000',
+  'aws_allow_http' 'true',
+  'aws_region' 'us-east-1',
+  'aws_access_key_id' 'minio',
+  'aws_secret_access_key' 'minio-secret'
+);
+```
+
+Azure Blob Storage:
+
+```sql
+CREATE EXTERNAL TABLE obs STORED AS lance_nd LOCATION 'az://my-container/obs.lance'
+OPTIONS ('azure_storage_account_name' 'myaccount');
+```
+
+Google Cloud Storage, with a service account key file:
+
+```sql
+CREATE EXTERNAL TABLE obs STORED AS lance_nd LOCATION 'gs://my-bucket/obs.lance'
+OPTIONS ('google_service_account' '/secrets/service-account.json');
+```
+
+Frequent keys:
+
+| Store | Keys |
+| --- | --- |
+| Amazon S3 | `aws_region`, `aws_endpoint`, `aws_access_key_id`, `aws_secret_access_key`, `aws_session_token`, `aws_allow_http` |
+| Azure | `azure_storage_account_name`, `azure_storage_account_key`, `azure_storage_sas_key` |
+| Google Cloud Storage | `google_service_account` (a key file), `google_service_account_key` (the JSON key) |
+| All stores | `timeout`, `connect_timeout`, `client_max_retries` |
+
+See [object_store](https://docs.rs/object_store/0.13.2/object_store/) for all keys.
 
 ### Columns
 
@@ -35,7 +92,7 @@ The plugin reads the columns from the table. Do not give a column list.
 | `var.key` for each attribute of a variable, for example `sst.units` | The `attrs` of the variable | The value of the attribute. The value is the same on all flat rows of one lance-nd row. |
 | `.key` for each global attribute, for example `.id` | The children of `__global_attrs__` | The value of the attribute. The value is the same on all flat rows of one lance-nd row. |
 
-These names are the same as the names of the Beacon NetCDF and Zarr readers.
+These names are the same as the names of the Beacon NetCDF, Zarr and HDF5 readers.
 Put quotes around an attribute column in SQL: `"sst.units"` and `".id"`. Without quotes, SQL reads `sst.units` as column `units` of table `sst`.
 
 Rules:
@@ -44,6 +101,38 @@ Rules:
 - A variable that a row does not have is null on all flat rows of that row. Its attributes are null too.
 - A row without variables gives one flat row.
 - The plugin does not read `__stats__`.
+
+### Examples
+
+Select the values of a variable with its unit:
+
+```sql
+SELECT time, lat, lon, sst, "sst.units" FROM obs;
+```
+
+Select the rows of one lance-nd row, with a global attribute:
+
+```sql
+SELECT * FROM obs WHERE ".id" = 'a';
+```
+
+Show the units of each variable:
+
+```sql
+SELECT DISTINCT "sst.units", "temperature.units" FROM obs;
+```
+
+Count the cells of each dataset:
+
+```sql
+SELECT ".id", count(*) FROM obs GROUP BY ".id";
+```
+
+Filter on a variable attribute. The filter goes to Lance, so Lance reads only the rows with this unit:
+
+```sql
+SELECT avg(sst) FROM obs WHERE "sst.units" = 'K';
+```
 
 ### Filters
 
@@ -70,7 +159,6 @@ Each query reads the latest version of the table.
 ## Limits
 
 - The plugin reads lance-nd tables. It does not write them. `INSERT INTO` and `COPY TO` are not available.
-- The plugin reads local files only. Cloud object stores are not available.
 - The plugin keeps one full lance-nd row in memory after it flattens the row. Large rows need much memory.
 - A query reads all variables of a row to find its grid, also when the query uses fewer columns.
 

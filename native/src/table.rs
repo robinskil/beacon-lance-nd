@@ -3,6 +3,7 @@
 //! `CREATE EXTERNAL TABLE t STORED AS lance_nd LOCATION '<uri>'` opens the lance-nd table at `<uri>`.
 //! The columns are the variables of the table, then the keys of its global attributes.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -21,6 +22,7 @@ use beacon_plugin_sdk::datafusion::physical_plan::streaming::{
 };
 use beacon_plugin_sdk::table_type::{TableType, table_option};
 use lance::Dataset;
+use lance::dataset::builder::DatasetBuilder;
 use lance::table::format::Fragment;
 
 use crate::filter::to_lance;
@@ -52,14 +54,14 @@ impl TableProviderFactory for LanceNdFactory {
             },
         };
         let uri = cmd.location.clone();
-        let dataset = Dataset::open(&uri)
-            .await
-            .map_err(|e| plan_datafusion_err!("lance_nd: cannot open `{uri}`: {e}"))?;
+        let storage = storage_options(&cmd.options);
+        let dataset = open(&uri, &storage).await?;
         let (schema, columns) =
             table_schema(&dataset).map_err(|e| e.context(format!("table `{uri}`")))?;
         let columns = columns.into();
         Ok(Arc::new(LanceNdTable {
             uri,
+            storage,
             schema,
             columns,
             partitions,
@@ -70,6 +72,8 @@ impl TableProviderFactory for LanceNdFactory {
 /// A lance-nd table. Each scan opens the latest version.
 pub struct LanceNdTable {
     uri: String,
+    /// Lance storage options, for example the credentials of an object store.
+    storage: HashMap<String, String>,
     schema: SchemaRef,
     columns: Arc<[Column]>,
     partitions: Option<usize>,
@@ -114,11 +118,7 @@ impl TableProvider for LanceNdTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let uri = &self.uri;
-        let dataset = Dataset::open(uri)
-            .await
-            .map_err(|e| plan_datafusion_err!("lance_nd: cannot open `{uri}`: {e}"))?;
-        let dataset = Arc::new(dataset);
+        let dataset = Arc::new(open(&self.uri, &self.storage).await?);
         let (schema, columns): (SchemaRef, Arc<[Column]>) = match projection {
             Some(indices) => (
                 Arc::new(self.schema.project(indices)?),
@@ -172,6 +172,25 @@ fn fragment_groups(fragments: &[Fragment], count: usize) -> Vec<Vec<Fragment>> {
     groups
 }
 
+/// The table options that go to Lance as storage options.
+pub fn storage_options(options: &HashMap<String, String>) -> HashMap<String, String> {
+    options
+        .iter()
+        .map(|(key, value)| (key.strip_prefix("format.").unwrap_or(key), value))
+        .filter(|(key, _)| *key != PARTITIONS)
+        .map(|(key, value)| (key.to_string(), value.clone()))
+        .collect()
+}
+
+/// Opens the latest version of the Lance table at `uri`.
+async fn open(uri: &str, storage: &HashMap<String, String>) -> Result<Dataset> {
+    DatasetBuilder::from_uri(uri)
+        .with_storage_options(storage.clone())
+        .load()
+        .await
+        .map_err(|e| plan_datafusion_err!("lance_nd: cannot open `{uri}`: {e}"))
+}
+
 /// Returns every table type of the plugin.
 pub fn tables() -> Vec<TableType> {
     vec![TableType::new("lance_nd", Arc::new(LanceNdFactory))]
@@ -185,6 +204,7 @@ mod tests {
     use beacon_plugin_sdk::datafusion::arrow::datatypes::{DataType, Field, Float64Type, Schema};
     use beacon_plugin_sdk::datafusion::prelude::SessionContext;
     use nd_arrow_array::Attributes;
+    use std::collections::HashMap;
 
     use super::*;
 
@@ -390,5 +410,54 @@ mod tests {
         let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
         assert_eq!(batches[0].column(0).null_count(), 1);
+    }
+
+    /// The error of a CREATE at `location`, or `None` when it runs past 20 seconds.
+    async fn create_error(location: &str, options: &str) -> Option<String> {
+        let ctx = session();
+        let sql = format!(
+            "CREATE EXTERNAL TABLE t STORED AS lance_nd LOCATION '{location}' OPTIONS ({options})"
+        );
+        let run = async { ctx.sql(&sql).await.map(|_| ()) };
+        match tokio::time::timeout(std::time::Duration::from_secs(20), run).await {
+            Ok(result) => Some(result.unwrap_err().to_string()),
+            Err(_) => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn cloud_schemes_have_a_store() {
+        let cases = [
+            (
+                "s3://bucket/t.lance",
+                "'aws_endpoint' 'http://127.0.0.1:9', 'aws_allow_http' 'true',                  'aws_region' 'us-east-1', 'aws_access_key_id' 'k',                  'aws_secret_access_key' 's', 'client_max_retries' '0'",
+            ),
+            (
+                "az://container/t.lance",
+                "'azure_storage_account_name' 'account', 'azure_storage_account_key' 'a2V5',                  'client_max_retries' '0'",
+            ),
+            ("gs://bucket/t.lance", "'client_max_retries' '0'"),
+        ];
+        for (location, options) in cases {
+            if let Some(error) = create_error(location, options).await {
+                assert!(
+                    !error.contains("No object store provider"),
+                    "{location}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn storage_options_skip_plugin_keys() {
+        let options = HashMap::from([
+            ("format.aws_region".to_string(), "eu-west-1".to_string()),
+            ("format.partitions".to_string(), "4".to_string()),
+            ("aws_endpoint".to_string(), "http://minio:9000".to_string()),
+        ]);
+        let storage = storage_options(&options);
+        assert_eq!(storage.len(), 2);
+        assert_eq!(storage["aws_region"], "eu-west-1");
+        assert_eq!(storage["aws_endpoint"], "http://minio:9000");
     }
 }

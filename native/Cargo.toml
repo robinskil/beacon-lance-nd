@@ -12,7 +12,7 @@ crate-type = ["cdylib"]
 # Pin a Beacon release tag here. The tag fixes the DataFusion version.
 beacon-plugin-sdk = { git = "https://github.com/maris-development/beacon", branch = "main" }
 # The Lance pin must match the Lance pin of Beacon.
-lance = { version = "=11.0.0", default-features = false }
+lance = { version = "=11.0.0", default-features = false, features = ["aws", "azure", "gcp"] }
 lance-nd = { git = "https://github.com/robinskil/lance-nd", rev = "16da270354f08a98776c78e3393d7671d8bd045e" }
 # Same source as lance-nd, so both use one crate. Cargo.lock pins the commit.
 nd-arrow-array = { git = "https://github.com/robinskil/nd-arrow-array" }
@@ -21,4 +21,4 @@ futures = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
