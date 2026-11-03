@@ -3765,7 +3765,7 @@ dependencies = [
 [[package]]
 name = "lance-nd"
 version = "0.1.0"
-source = "git+https://github.com/robinskil/lance-nd?rev=16da270354f08a98776c78e3393d7671d8bd045e#16da270354f08a98776c78e3393d7671d8bd045e"
+source = "git+https://github.com/robinskil/lance-nd?rev=f3218c8c16a7645acb3d84c783803f793d3c7fdf#f3218c8c16a7645acb3d84c783803f793d3c7fdf"
 dependencies = [
  "arrow",
  "futures",

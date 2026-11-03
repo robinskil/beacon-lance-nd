@@ -13,7 +13,7 @@ crate-type = ["cdylib"]
 beacon-plugin-sdk = { git = "https://github.com/maris-development/beacon", branch = "main" }
 # The Lance pin must match the Lance pin of Beacon.
 lance = { version = "=11.0.0", default-features = false, features = ["aws", "azure", "gcp"] }
-lance-nd = { git = "https://github.com/robinskil/lance-nd", rev = "16da270354f08a98776c78e3393d7671d8bd045e" }
+lance-nd = { git = "https://github.com/robinskil/lance-nd", rev = "f3218c8c16a7645acb3d84c783803f793d3c7fdf" }
 # Same source as lance-nd, so both use one crate. Cargo.lock pins the commit.
 nd-arrow-array = { git = "https://github.com/robinskil/nd-arrow-array" }
 async-trait = "0.1"

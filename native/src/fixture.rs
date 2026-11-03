@@ -71,6 +71,11 @@ fn grid_row(x: &[f64], base: f32, units: &str, id: &str) -> NdRecordBatch {
 
 /// Writes each row in its own commit, so each row is one fragment. Returns the URI.
 pub async fn write_rows(dir: &Path, rows: Vec<NdRecordBatch>) -> String {
+    write_rows_with(dir, rows, false).await
+}
+
+/// Writes one commit per row, with per-row stats when `stats` is `true`. Returns the URI.
+pub async fn write_rows_with(dir: &Path, rows: Vec<NdRecordBatch>, stats: bool) -> String {
     let uri = dir.join("table.lance").to_str().unwrap().to_string();
     for (index, row) in rows.into_iter().enumerate() {
         let options = WriteOptions {
@@ -79,6 +84,7 @@ pub async fn write_rows(dir: &Path, rows: Vec<NdRecordBatch>) -> String {
             } else {
                 WriteMode::Append
             },
+            stats,
             ..WriteOptions::default()
         };
         lance_nd::write(&uri, stream::iter([Ok(row)]), &options)

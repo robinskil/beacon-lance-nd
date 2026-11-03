@@ -208,7 +208,9 @@ mod tests {
 
     use super::*;
 
-    use crate::fixture::{field_type, row0, session, write_fixture, write_rows};
+    use crate::fixture::{
+        field_type, row0, row1, row2, session, write_fixture, write_rows, write_rows_with,
+    };
 
     async fn create(sql: &str) -> String {
         let ctx = session();
@@ -459,5 +461,22 @@ mod tests {
         assert_eq!(storage.len(), 2);
         assert_eq!(storage["aws_region"], "eu-west-1");
         assert_eq!(storage["aws_endpoint"], "http://minio:9000");
+    }
+
+    #[tokio::test]
+    async fn stats_column_is_not_a_variable() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = write_rows_with(dir.path(), vec![row0(), row1(), row2()], true).await;
+        let ctx = session();
+        let sql = format!("CREATE EXTERNAL TABLE t STORED AS lance_nd LOCATION '{uri}'");
+        ctx.sql(&sql).await.unwrap();
+        let schema = ctx.table("t").await.unwrap().schema().as_arrow().clone();
+        assert!(
+            schema
+                .fields()
+                .iter()
+                .all(|f| !f.name().contains("__stats__"))
+        );
+        assert_eq!(number(&ctx, "SELECT count(*) FROM t").await, 23.0);
     }
 }
