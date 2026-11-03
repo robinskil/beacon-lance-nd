@@ -1,4 +1,4 @@
-//! Flattens one nd record batch onto its grid: one flat row per grid cell.
+//! Flattens one nd record batch onto the grid of its selected variables: one flat row per cell.
 
 use beacon_plugin_sdk::datafusion::arrow::array::{
     ArrayRef, RecordBatch, RecordBatchOptions, new_null_array,
@@ -6,29 +6,25 @@ use beacon_plugin_sdk::datafusion::arrow::array::{
 use beacon_plugin_sdk::datafusion::arrow::compute::cast;
 use beacon_plugin_sdk::datafusion::arrow::datatypes::{Field, SchemaRef};
 use beacon_plugin_sdk::datafusion::common::{DataFusionError, Result, ScalarValue, exec_err};
-use nd_arrow_array::NdRecordBatch;
+use nd_arrow_array::{Dimension, Dimensions, NdArrowArray, NdRecordBatch};
 
 use crate::schema::Column;
 
 /// The flat rows of `row` for the projected `schema` and `columns`, in batches of at most
-/// `batch_size` rows. The grid is the target of the full row.
+/// `batch_size` rows. See [`grid`] for the grid.
 pub fn flatten(
     row: &NdRecordBatch,
     schema: &SchemaRef,
     columns: &[Column],
     batch_size: usize,
 ) -> Result<Vec<RecordBatch>> {
-    let Some(cells) = row.target().checked_num_elements() else {
-        return exec_err!(
-            "lance_nd: the grid of a row is too large: {:?}",
-            row.target().shape()
-        );
-    };
+    let grid = grid(row, columns)?;
+    let cells = grid.num_elements();
     let arrays = schema
         .fields()
         .iter()
         .zip(columns)
-        .map(|(field, column)| flat_column(row, field, column, cells))
+        .map(|(field, column)| flat_column(row, &grid, field, column, cells))
         .collect::<Result<Vec<_>>>()?;
     let options = RecordBatchOptions::new().with_row_count(Some(cells));
     let full = RecordBatch::try_new_with_options(schema.clone(), arrays, &options)?;
@@ -39,9 +35,73 @@ pub fn flatten(
         .collect())
 }
 
-/// The values of one column on each of the `cells` grid cells of `row`.
+/// The grid of `row`: the dimensions of the selected variable that holds the dimensions of all
+/// other selected variables of the row.
+///
+/// An attribute column does not add dimensions. Without a selected variable, the grid is one
+/// cell. Selected variables without such a variable give an error, so no query broadcasts
+/// variables of different grids against each other.
+pub fn grid(row: &NdRecordBatch, columns: &[Column]) -> Result<Dimensions> {
+    let selected: Vec<(&str, &NdArrowArray)> = columns
+        .iter()
+        .filter_map(|column| match column {
+            Column::Variable(name) => row.column_by_name(name).map(|a| (name.as_str(), a)),
+            _ => None,
+        })
+        .collect();
+    // `inner` broadcasts onto `outer` when `outer` has each of its dimensions.
+    let fits = |inner: &NdArrowArray, outer: &NdArrowArray| {
+        inner.dims().iter().all(|d| {
+            outer
+                .dims()
+                .iter()
+                .any(|o| o.name() == d.name() && (o.size() == d.size() || d.size() == 1))
+        })
+    };
+    if selected.is_empty() {
+        return Dimensions::try_new(Vec::<Dimension>::new())
+            .map_err(|e| DataFusionError::External(Box::new(e)));
+    }
+    match selected
+        .iter()
+        .find(|(_, outer)| selected.iter().all(|(_, inner)| fits(inner, outer)))
+    {
+        Some((_, outer)) => Ok(outer.dims().clone()),
+        None => {
+            // One entry per dimension set, with its first variables.
+            let mut groups: Vec<(String, Vec<&str>)> = Vec::new();
+            for (name, array) in &selected {
+                let dims: Vec<String> = array
+                    .dims()
+                    .iter()
+                    .map(|d| format!("{}={}", d.name(), d.size()))
+                    .collect();
+                let dims = format!("({})", dims.join(", "));
+                match groups.iter_mut().find(|(d, _)| *d == dims) {
+                    Some((_, names)) => names.push(name),
+                    None => groups.push((dims, vec![name])),
+                }
+            }
+            let shown: Vec<String> = groups
+                .iter()
+                .map(|(dims, names)| match names.len() {
+                    0..=3 => format!("{dims}: {}", names.join(", ")),
+                    n => format!("{dims}: {} and {} more", names[..3].join(", "), n - 3),
+                })
+                .collect();
+            exec_err!(
+                "lance_nd: the selected variables have no common grid. Select variables whose \
+                 dimensions are all in the dimensions of one selected variable. Selected: {}",
+                shown.join("; ")
+            )
+        }
+    }
+}
+
+/// The values of one column on each of the `cells` cells of `grid`.
 fn flat_column(
     row: &NdRecordBatch,
+    grid: &Dimensions,
     field: &Field,
     column: &Column,
     cells: usize,
@@ -49,7 +109,7 @@ fn flat_column(
     let array = match column {
         Column::Variable(name) => match row.column_by_name(name) {
             Some(array) => array
-                .broadcast_to(row.target())
+                .broadcast_to(grid)
                 .map_err(|e| DataFusionError::External(Box::new(e)))?
                 .values()
                 .clone(),
@@ -152,10 +212,10 @@ mod tests {
 
     #[test]
     fn attribute_repeats() {
-        let batch = one(&row0(), &[".id"]);
-        assert_eq!(batch.num_rows(), 12);
+        let batch = one(&row0(), &["x", ".id"]);
+        assert_eq!(batch.num_rows(), 3);
         let id = batch
-            .column(0)
+            .column(1)
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
@@ -172,10 +232,10 @@ mod tests {
     }
 
     #[test]
-    fn no_columns_keeps_the_count() {
+    fn no_variables_is_one_row() {
         let batches = run(&row0(), &[], 8192);
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(rows, 12);
+        assert_eq!(rows, 1);
         assert!(batches.iter().all(|b| b.num_columns() == 0));
     }
 
@@ -210,35 +270,26 @@ mod tests {
     }
 
     #[test]
-    fn grid_overflow_is_an_error() {
-        let size = 1 << 16;
-        let names = ["a", "b", "c", "d"];
-        let arrays: Vec<_> = names
-            .iter()
-            .map(|name| {
-                let values = Arc::new(Float32Array::from(vec![0.0; size]));
-                let dims = nd_arrow_array::Dimensions::try_new([(*name, size)]).unwrap();
-                nd_arrow_array::NdArrowArray::try_new(values, dims).unwrap()
-            })
-            .collect();
-        let fields: Vec<Field> = names
-            .iter()
-            .map(|name| Field::new(*name, DataType::Float32, true))
-            .collect();
-        let row = NdRecordBatch::try_new_inferred(Arc::new(Schema::new(fields)), arrays).unwrap();
-        let (schema, columns) = projection(&[]);
-        let error = flatten(&row, &schema, &columns, 8192)
+    fn different_grids_are_an_error() {
+        let (schema, columns) = projection(&["x", "y"]);
+        let error = flatten(&row0(), &schema, &columns, 8192)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("too large"), "{error}");
+        assert!(error.contains("no common grid"), "{error}");
+    }
+
+    #[test]
+    fn grid_takes_a_variable_that_holds_the_others() {
+        let batch = one(&row0(), &["x", "temperature", "y"]);
+        assert_eq!(batch.num_rows(), 12);
     }
 
     #[test]
     fn variable_attribute_repeats() {
-        let batch = one(&row0(), &["temperature.units"]);
-        assert_eq!(batch.num_rows(), 12);
+        let batch = one(&row0(), &["x", "temperature.units"]);
+        assert_eq!(batch.num_rows(), 3);
         let units = batch
-            .column(0)
+            .column(1)
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
@@ -247,8 +298,8 @@ mod tests {
 
     #[test]
     fn attribute_of_an_absent_variable_is_null() {
-        let batch = one(&row1(), &["temperature.units"]);
+        let batch = one(&row1(), &["pressure", "temperature.units"]);
         assert_eq!(batch.num_rows(), 3);
-        assert_eq!(batch.column(0).null_count(), 3);
+        assert_eq!(batch.column(1).null_count(), 3);
     }
 }

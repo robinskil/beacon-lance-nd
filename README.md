@@ -97,9 +97,11 @@ Put quotes around an attribute column in SQL: `"sst.units"` and `".id"`. Without
 
 Rules:
 
-- The grid of a lance-nd row comes from all variables of that row. The column list of a query does not change the grid, so `SELECT x` and `SELECT x, sst` give the same number of rows.
-- A variable that a row does not have is null on all flat rows of that row. Its attributes are null too.
-- A row without variables gives one flat row.
+- The variables of the query set the grid of each lance-nd row. The grid is the dimensions of one selected variable. The dimensions of each other selected variable must be in that grid. For example, `SELECT time, lat, sst` with `sst(time, lat)` gives one flat row for each value of `sst`, and `time` and `lat` repeat.
+- If no selected variable holds the dimensions of all other selected variables, the query fails. For example, `PRES(N_PROF, N_LEVELS)` and `PARAMETER(N_PROF, N_CALIB, N_PARAM)` have no common grid. The error names the dimension sets of the selected variables. So `SELECT *` fails on a table with variables of different grids.
+- An attribute column, for example `"sst.units"`, does not add the dimensions of its variable to the grid.
+- A query without variables gives one flat row for each lance-nd row. So `SELECT count(*) FROM obs` counts the lance-nd rows.
+- A selected variable that a row does not have is null on all flat rows of that row. Its attributes are null too.
 - The plugin does not read `__stats__`.
 
 ### Examples
@@ -122,10 +124,21 @@ Show the units of each variable:
 SELECT DISTINCT "sst.units", "temperature.units" FROM obs;
 ```
 
-Count the cells of each dataset:
+Count the values of `sst` in each dataset:
 
 ```sql
-SELECT ".id", count(*) FROM obs GROUP BY ".id";
+SELECT ".id", count(sst) FROM obs GROUP BY ".id";
+```
+
+Average the temperature per 1° cell for one area, one time range and one pressure range:
+
+```sql
+SELECT floor("LATITUDE") AS lat, floor("LONGITUDE") AS lon, avg("TEMP") AS mean_temp
+FROM argo
+WHERE "LATITUDE" BETWEEN 20 AND 30 AND "LONGITUDE" BETWEEN -98 AND -80
+  AND "JULD" >= TIMESTAMP '2010-01-01' AND "JULD" < TIMESTAMP '2016-01-01'
+  AND "PRES" BETWEEN 0 AND 100 AND "TEMP_QC" = '1'
+GROUP BY 1, 2;
 ```
 
 Filter on a variable attribute. The filter goes to Lance, so Lance reads only the rows with this unit:
@@ -180,8 +193,8 @@ Each query reads the latest version of the table.
 ## Limits
 
 - The plugin reads lance-nd tables. It does not write them. `INSERT INTO` and `COPY TO` are not available.
-- The plugin keeps one full lance-nd row in memory after it flattens the row. Large rows need much memory.
-- A query reads all variables of a row to find its grid, also when the query uses fewer columns.
+- The plugin keeps the selected variables of one lance-nd row in memory after it flattens the row. Large rows need much memory.
+- A query reads the selected variables of each row. An attribute column of a variable, for example `"sst.units"`, also reads the values of that variable.
 
 ## Build and test
 

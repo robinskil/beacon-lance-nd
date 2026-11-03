@@ -286,17 +286,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn count_star_counts_cells() {
+    async fn count_star_counts_datasets() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = table(&dir, "").await;
-        assert_eq!(number(&ctx, "SELECT count(*) FROM t").await, 23.0);
+        assert_eq!(number(&ctx, "SELECT count(*) FROM t").await, 3.0);
+        // Row 1 has no temperature: one cell with a null.
+        assert_eq!(
+            number(&ctx, "SELECT count(*) FROM t WHERE temperature IS NOT NULL").await,
+            20.0
+        );
     }
 
     #[tokio::test]
-    async fn projection_keeps_the_full_grid() {
+    async fn selected_variables_set_the_grid() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = table(&dir, "").await;
-        assert_eq!(rows(&ctx, r#"SELECT x FROM t WHERE ".id" = 'a'"#).await, 12);
+        assert_eq!(rows(&ctx, r#"SELECT x FROM t WHERE ".id" = 'a'"#).await, 3);
+        assert_eq!(
+            rows(&ctx, r#"SELECT x, temperature FROM t WHERE ".id" = 'a'"#).await,
+            12
+        );
+        // An attribute of a variable does not add the dimensions of the variable.
+        let sql = r#"SELECT x, "temperature.units" FROM t WHERE ".id" = 'a'"#;
+        assert_eq!(rows(&ctx, sql).await, 3);
+    }
+
+    #[tokio::test]
+    async fn different_grids_are_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = table(&dir, "").await;
+        let error = ctx
+            .sql("SELECT x, y FROM t")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no common grid"), "{error}");
+        assert!(
+            error.contains("(x=3): x") && error.contains("(y=4): y"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -325,7 +356,7 @@ mod tests {
     async fn partitions_give_the_same_result() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = table(&dir, "OPTIONS ('partitions' '4')").await;
-        assert_eq!(number(&ctx, "SELECT count(*) FROM t").await, 23.0);
+        assert_eq!(number(&ctx, "SELECT count(*) FROM t").await, 3.0);
         assert_eq!(
             number(&ctx, "SELECT sum(temperature) FROM t").await,
             66.0 + 828.0
@@ -337,8 +368,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ctx = table(&dir, "").await;
         let sql = r#"SELECT count(*) FROM t WHERE ".id" IN ('a', 'c')"#;
-        assert_eq!(number(&ctx, sql).await, 20.0);
-        assert_eq!(scan_rows(&ctx, sql).await, 20);
+        assert_eq!(number(&ctx, sql).await, 2.0);
+        assert_eq!(scan_rows(&ctx, sql).await, 2);
     }
 
     #[tokio::test]
@@ -350,8 +381,8 @@ mod tests {
         let sql = format!("CREATE EXTERNAL TABLE t STORED AS lance_nd LOCATION '{uri}'");
         ctx.sql(&sql).await.unwrap();
         let sql = r#"SELECT count(*) FROM t WHERE ".null" = 'k'"#;
-        assert_eq!(number(&ctx, sql).await, 12.0);
-        assert_eq!(scan_rows(&ctx, sql).await, 12);
+        assert_eq!(number(&ctx, sql).await, 1.0);
+        assert_eq!(scan_rows(&ctx, sql).await, 1);
     }
 
     #[tokio::test]
@@ -373,8 +404,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ctx = table(&dir, "").await;
         let sql = r#"SELECT count(*) FROM t WHERE "temperature.units" = 'C'"#;
-        assert_eq!(number(&ctx, sql).await, 8.0);
-        assert_eq!(scan_rows(&ctx, sql).await, 8);
+        assert_eq!(number(&ctx, sql).await, 1.0);
+        assert_eq!(scan_rows(&ctx, sql).await, 1);
     }
 
     #[tokio::test]
@@ -450,7 +481,7 @@ mod tests {
                 .iter()
                 .all(|f| !f.name().contains("__stats__"))
         );
-        assert_eq!(number(&ctx, "SELECT count(*) FROM t").await, 23.0);
+        assert_eq!(number(&ctx, "SELECT count(*) FROM t").await, 3.0);
     }
 
     /// The flat rows of the scan node alone, without the filter of DataFusion.
@@ -515,7 +546,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ctx = table(&dir, "").await;
         let sql = "SELECT temperature FROM t WHERE temperature > 50";
-        assert_eq!(scan_rows(&ctx, sql).await, 23);
+        // 12 and 8 cells, and one cell for row 1, which has no temperature.
+        assert_eq!(scan_rows(&ctx, sql).await, 21);
         assert_eq!(rows(&ctx, sql).await, 8);
     }
 
@@ -524,9 +556,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ctx = stats_table(&dir).await;
         let sql = r#"SELECT count(*) FROM t WHERE ".id" = 'b' OR temperature > 50"#;
-        // Row 1 by its id, row 2 by its stats. Row 0 has neither.
-        assert_eq!(scan_rows(&ctx, sql).await, 11);
-        assert_eq!(number(&ctx, sql).await, 11.0);
+        // Row 1 (one cell) by its id, row 2 (8 cells) by its stats. Row 0 has neither.
+        assert_eq!(scan_rows(&ctx, sql).await, 9);
+        assert_eq!(number(&ctx, sql).await, 9.0);
     }
 
     #[tokio::test]
@@ -534,8 +566,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ctx = table(&dir, "").await;
         let sql = r#"SELECT count(*) FROM t WHERE NOT (".id" = 'a')"#;
-        assert_eq!(scan_rows(&ctx, sql).await, 11);
-        assert_eq!(number(&ctx, sql).await, 11.0);
+        assert_eq!(scan_rows(&ctx, sql).await, 2);
+        assert_eq!(number(&ctx, sql).await, 2.0);
     }
 
     #[tokio::test]
@@ -580,7 +612,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ctx = stats_table(&dir).await;
         let cases = [
-            (r#"SELECT count(*) FROM t WHERE ".id" LIKE 'c%'"#, 8, 8.0),
+            (r#"SELECT count(*) FROM t WHERE ".id" LIKE 'c%'"#, 1, 1.0),
             (
                 "SELECT count(*) FROM t WHERE temperature BETWEEN 50 AND 200",
                 8,
@@ -588,8 +620,8 @@ mod tests {
             ),
             (
                 r#"SELECT count(*) FROM t WHERE CAST(".id" AS VARCHAR) = 'a'"#,
-                12,
-                12.0,
+                1,
+                1.0,
             ),
         ];
         for (sql, scanned, count) in cases {

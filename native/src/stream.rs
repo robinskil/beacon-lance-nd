@@ -54,9 +54,11 @@ impl PartitionStream for LanceNdPartition {
         let filter = self.filter.clone();
         let schema = Arc::clone(&self.schema);
         let columns = Arc::clone(&self.columns);
+        let read = variables_to_read(&columns);
         let rows = stream::once(async move {
-            // No projection: the grid of a row needs all of its variables.
-            let mut scanner = lance_nd::scan(&dataset).fragments(fragments);
+            let mut scanner = lance_nd::scan(&dataset)
+                .project(&read.iter().map(String::as_str).collect::<Vec<_>>())
+                .fragments(fragments);
             if let Some(filter) = filter {
                 scanner = scanner.filter_expr(filter);
             }
@@ -71,4 +73,21 @@ impl PartitionStream for LanceNdPartition {
             .try_flatten();
         Box::pin(RecordBatchStreamAdapter::new(schema, batches))
     }
+}
+
+/// The variables that `columns` read: each variable, and each variable with a selected
+/// attribute. Each name comes once, in column order.
+fn variables_to_read(columns: &[Column]) -> Vec<String> {
+    let mut read: Vec<String> = Vec::new();
+    for column in columns {
+        let name = match column {
+            Column::Variable(name) => name,
+            Column::VariableAttribute { variable, .. } => variable,
+            Column::Attribute(_) => continue,
+        };
+        if !read.contains(name) {
+            read.push(name.clone());
+        }
+    }
+    read
 }
