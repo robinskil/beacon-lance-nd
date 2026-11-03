@@ -3765,15 +3765,17 @@ dependencies = [
 [[package]]
 name = "lance-nd"
 version = "0.1.0"
-source = "git+https://github.com/robinskil/lance-nd?rev=f3218c8c16a7645acb3d84c783803f793d3c7fdf#f3218c8c16a7645acb3d84c783803f793d3c7fdf"
+source = "git+https://github.com/robinskil/lance-nd?rev=6c827caf9a610d7cab95d277ec5ebb437238d22d#6c827caf9a610d7cab95d277ec5ebb437238d22d"
 dependencies = [
  "arrow",
+ "chrono",
  "futures",
  "lance",
  "lance-core",
  "lance-file",
  "nd-arrow-array",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

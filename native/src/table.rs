@@ -8,7 +8,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use beacon_plugin_sdk::datafusion::arrow::datatypes::{Schema, SchemaRef};
+use beacon_plugin_sdk::datafusion::arrow::datatypes::SchemaRef;
 use beacon_plugin_sdk::datafusion::catalog::{Session, TableProvider, TableProviderFactory};
 use beacon_plugin_sdk::datafusion::common::{Result, plan_datafusion_err, plan_err};
 use beacon_plugin_sdk::datafusion::datasource::TableType as DfTableType;
@@ -25,7 +25,7 @@ use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 use lance::table::format::Fragment;
 
-use crate::filter::{is_variable_filter, to_lance, to_stats};
+use crate::filter::to_lance;
 use crate::schema::{Column, table_schema};
 use crate::stream::LanceNdPartition;
 
@@ -104,12 +104,9 @@ impl TableProvider for LanceNdTable {
         // DataFusion applies each filter again, so Lance may keep extra rows.
         Ok(filters
             .iter()
-            .map(|f| {
-                if to_lance(f, &self.columns).is_some() || is_variable_filter(f, &self.columns) {
-                    TableProviderFilterPushDown::Inexact
-                } else {
-                    TableProviderFilterPushDown::Unsupported
-                }
+            .map(|f| match to_lance(f, &self.columns) {
+                Some(_) => TableProviderFilterPushDown::Inexact,
+                None => TableProviderFilterPushDown::Unsupported,
             })
             .collect())
     }
@@ -129,18 +126,10 @@ impl TableProvider for LanceNdTable {
             ),
             None => (Arc::clone(&self.schema), Arc::clone(&self.columns)),
         };
-        let table = Schema::from(dataset.schema());
-        let pushed: Vec<String> = filters
+        let filter = filters
             .iter()
-            .filter_map(|f| {
-                to_lance(f, &self.columns).or_else(|| to_stats(f, &self.columns, &table))
-            })
-            .collect();
-        let filter = match pushed.len() {
-            0 => None,
-            1 => pushed.into_iter().next(),
-            _ => Some(format!("({})", pushed.join(") AND ("))),
-        };
+            .filter_map(|f| to_lance(f, &self.columns))
+            .reduce(Expr::and);
         let count = self
             .partitions
             .unwrap_or_else(|| state.config().target_partitions());
@@ -205,18 +194,18 @@ pub fn tables() -> Vec<TableType> {
 #[cfg(test)]
 mod tests {
     use beacon_plugin_sdk::datafusion::arrow::array::{
-        AsArray, Int32Array, RecordBatch, RecordBatchIterator,
+        AsArray, Int32Array, RecordBatch, RecordBatchIterator, TimestampNanosecondArray,
     };
     use beacon_plugin_sdk::datafusion::arrow::datatypes::{DataType, Field, Float64Type, Schema};
     use beacon_plugin_sdk::datafusion::physical_plan::collect;
     use beacon_plugin_sdk::datafusion::prelude::SessionContext;
-    use nd_arrow_array::Attributes;
+    use nd_arrow_array::{Attributes, Dimensions, NdArrowArray};
     use std::collections::HashMap;
 
     use super::*;
 
     use crate::fixture::{
-        field_type, row0, row1, row2, session, write_fixture, write_rows, write_rows_with,
+        field_type, row, row0, row1, row2, session, write_fixture, write_rows, write_rows_with,
     };
 
     async fn create(sql: &str) -> String {
@@ -349,35 +338,20 @@ mod tests {
         let ctx = table(&dir, "").await;
         let sql = r#"SELECT count(*) FROM t WHERE ".id" IN ('a', 'c')"#;
         assert_eq!(number(&ctx, sql).await, 20.0);
-        let plan = ctx
-            .sql(sql)
-            .await
-            .unwrap()
-            .create_physical_plan()
-            .await
-            .unwrap();
-        let shown = scan_partitions(&plan);
-        assert!(shown.contains("__global_attrs__.id = 'c'"), "{shown}");
-    }
-
-    /// The Debug text of the partitions of the first `StreamingTableExec` in `plan`.
-    fn scan_partitions(plan: &Arc<dyn ExecutionPlan>) -> String {
-        if let Some(exec) = plan.downcast_ref::<StreamingTableExec>() {
-            return format!("{:?}", exec.partitions());
-        }
-        plan.children().into_iter().map(scan_partitions).collect()
+        assert_eq!(scan_rows(&ctx, sql).await, 20);
     }
 
     #[tokio::test]
-    async fn keyword_attribute_falls_back() {
+    async fn keyword_attribute_is_pushed() {
         let dir = tempfile::tempdir().unwrap();
         let attributes = Attributes::new().with("id", "a").with("null", "k");
-        let uri = write_rows(dir.path(), vec![row0().with_attributes(attributes)]).await;
+        let uri = write_rows(dir.path(), vec![row0().with_attributes(attributes), row1()]).await;
         let ctx = session();
         let sql = format!("CREATE EXTERNAL TABLE t STORED AS lance_nd LOCATION '{uri}'");
         ctx.sql(&sql).await.unwrap();
         let sql = r#"SELECT count(*) FROM t WHERE ".null" = 'k'"#;
         assert_eq!(number(&ctx, sql).await, 12.0);
+        assert_eq!(scan_rows(&ctx, sql).await, 12);
     }
 
     #[tokio::test]
@@ -400,15 +374,7 @@ mod tests {
         let ctx = table(&dir, "").await;
         let sql = r#"SELECT count(*) FROM t WHERE "temperature.units" = 'C'"#;
         assert_eq!(number(&ctx, sql).await, 8.0);
-        let plan = ctx
-            .sql(sql)
-            .await
-            .unwrap()
-            .create_physical_plan()
-            .await
-            .unwrap();
-        let shown = scan_partitions(&plan);
-        assert!(shown.contains("temperature.attrs.units = 'C'"), "{shown}");
+        assert_eq!(scan_rows(&ctx, sql).await, 8);
     }
 
     #[tokio::test]
@@ -523,15 +489,6 @@ mod tests {
         // Only row 2 has a temperature above 50. Row 1 has no temperature.
         assert_eq!(scan_rows(&ctx, sql).await, 8);
         assert_eq!(rows(&ctx, sql).await, 8);
-        let plan = ctx
-            .sql(sql)
-            .await
-            .unwrap()
-            .create_physical_plan()
-            .await
-            .unwrap();
-        let shown = scan_partitions(&plan);
-        assert!(shown.contains("__stats__.temperature.max > 50"), "{shown}");
     }
 
     #[tokio::test]
@@ -547,19 +504,10 @@ mod tests {
     async fn stats_and_attribute_filters_combine() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = stats_table(&dir).await;
-        let sql = r#"SELECT temperature FROM t WHERE ".id" = 'c' AND temperature < 105"#;
+        let sql = r#"SELECT temperature FROM t WHERE ".id" IN ('a', 'c') AND temperature > 50"#;
+        // The attribute part keeps rows 0 and 2. The stats part keeps row 2.
         assert_eq!(scan_rows(&ctx, sql).await, 8);
-        assert_eq!(rows(&ctx, sql).await, 5);
-        let plan = ctx
-            .sql(sql)
-            .await
-            .unwrap()
-            .create_physical_plan()
-            .await
-            .unwrap();
-        let shown = scan_partitions(&plan);
-        assert!(shown.contains("__global_attrs__.id = 'c'"), "{shown}");
-        assert!(shown.contains("__stats__.temperature.min < 105"), "{shown}");
+        assert_eq!(rows(&ctx, sql).await, 8);
     }
 
     #[tokio::test]
@@ -569,5 +517,84 @@ mod tests {
         let sql = "SELECT temperature FROM t WHERE temperature > 50";
         assert_eq!(scan_rows(&ctx, sql).await, 23);
         assert_eq!(rows(&ctx, sql).await, 8);
+    }
+
+    #[tokio::test]
+    async fn mixed_or_skips_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = stats_table(&dir).await;
+        let sql = r#"SELECT count(*) FROM t WHERE ".id" = 'b' OR temperature > 50"#;
+        // Row 1 by its id, row 2 by its stats. Row 0 has neither.
+        assert_eq!(scan_rows(&ctx, sql).await, 11);
+        assert_eq!(number(&ctx, sql).await, 11.0);
+    }
+
+    #[tokio::test]
+    async fn not_over_an_attribute_is_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = table(&dir, "").await;
+        let sql = r#"SELECT count(*) FROM t WHERE NOT (".id" = 'a')"#;
+        assert_eq!(scan_rows(&ctx, sql).await, 11);
+        assert_eq!(number(&ctx, sql).await, 11.0);
+    }
+
+    #[tokio::test]
+    async fn not_over_a_variable_uses_the_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = stats_table(&dir).await;
+        let sql = "SELECT count(*) FROM t WHERE NOT (temperature > 50)";
+        // DataFusion pushes `temperature <= 50`: row 0 stays, row 1 has no temperature.
+        assert_eq!(scan_rows(&ctx, sql).await, 12);
+        assert_eq!(number(&ctx, sql).await, 12.0);
+    }
+
+    #[tokio::test]
+    async fn time_filter_uses_the_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let times = |values: Vec<i64>| {
+            NdArrowArray::try_new(
+                Arc::new(TimestampNanosecondArray::from(values)),
+                Dimensions::try_new([("time", 2)]).unwrap(),
+            )
+            .unwrap()
+        };
+        let second = 1_000_000_000;
+        let rows = vec![
+            row(vec![("time", times(vec![100 * second, 200 * second]))], "a"),
+            row(
+                vec![("time", times(vec![1000 * second, 2000 * second]))],
+                "b",
+            ),
+        ];
+        let uri = write_rows_with(dir.path(), rows, true).await;
+        let ctx = session();
+        let sql = format!("CREATE EXTERNAL TABLE t STORED AS lance_nd LOCATION '{uri}'");
+        ctx.sql(&sql).await.unwrap();
+        let sql = "SELECT count(*) FROM t WHERE time > TIMESTAMP '1970-01-01T00:08:20'";
+        assert_eq!(scan_rows(&ctx, sql).await, 2);
+        assert_eq!(number(&ctx, sql).await, 2.0);
+    }
+
+    #[tokio::test]
+    async fn like_between_and_cast_are_pushed() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = stats_table(&dir).await;
+        let cases = [
+            (r#"SELECT count(*) FROM t WHERE ".id" LIKE 'c%'"#, 8, 8.0),
+            (
+                "SELECT count(*) FROM t WHERE temperature BETWEEN 50 AND 200",
+                8,
+                8.0,
+            ),
+            (
+                r#"SELECT count(*) FROM t WHERE CAST(".id" AS VARCHAR) = 'a'"#,
+                12,
+                12.0,
+            ),
+        ];
+        for (sql, scanned, count) in cases {
+            assert_eq!(scan_rows(&ctx, sql).await, scanned, "{sql}");
+            assert_eq!(number(&ctx, sql).await, count, "{sql}");
+        }
     }
 }

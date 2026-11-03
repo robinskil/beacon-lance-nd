@@ -6,6 +6,7 @@ use std::sync::Arc;
 use beacon_plugin_sdk::datafusion::arrow::datatypes::SchemaRef;
 use beacon_plugin_sdk::datafusion::common::DataFusionError;
 use beacon_plugin_sdk::datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use beacon_plugin_sdk::datafusion::logical_expr::Expr;
 use beacon_plugin_sdk::datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use beacon_plugin_sdk::datafusion::physical_plan::streaming::PartitionStream;
 use futures::{StreamExt, TryStreamExt, stream};
@@ -19,8 +20,8 @@ use crate::schema::Column;
 pub struct LanceNdPartition {
     pub dataset: Arc<Dataset>,
     pub fragments: Vec<Fragment>,
-    /// A Lance SQL filter on the rows.
-    pub filter: Option<String>,
+    /// A filter on the Lance columns. lance-nd prunes its value parts with the stats.
+    pub filter: Option<Expr>,
     /// The projected schema.
     pub schema: SchemaRef,
     /// The source of each field of `schema`.
@@ -32,7 +33,7 @@ impl fmt::Debug for LanceNdPartition {
         let ids: Vec<u64> = self.fragments.iter().map(|fragment| fragment.id).collect();
         f.debug_struct("LanceNdPartition")
             .field("fragments", &ids)
-            .field("filter", &self.filter)
+            .field("filter", &self.filter.as_ref().map(|e| e.to_string()))
             .finish()
     }
 }
@@ -57,7 +58,7 @@ impl PartitionStream for LanceNdPartition {
             // No projection: the grid of a row needs all of its variables.
             let mut scanner = lance_nd::scan(&dataset).fragments(fragments);
             if let Some(filter) = filter {
-                scanner = scanner.filter(filter);
+                scanner = scanner.filter_expr(filter);
             }
             let rows = scanner.try_into_stream().await.map_err(external)?;
             Ok::<_, DataFusionError>(rows.map_err(external))

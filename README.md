@@ -136,20 +136,31 @@ SELECT avg(sst) FROM obs WHERE "sst.units" = 'K';
 
 ### Filters
 
-A filter on attribute columns goes to Lance. Lance then reads only the rows that match.
-These filters go to Lance: `=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, `IN`, `IS NULL` and `IS NOT NULL`, with string, number and boolean values.
-A filter on an attribute key named `true`, `false` or `null` runs in Beacon only.
+Beacon gives each filter to Lance when the filter uses only these parts:
 
-A table can have stats: the minimum and maximum value of each variable in each lance-nd row.
+- Columns: variables, attributes of variables and global attributes.
+- Operators: `=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, `IN`, `BETWEEN`, `LIKE`, `IS NULL`, `IS NOT NULL` and `CAST`.
+- Values: literals, for example strings, numbers, booleans and times.
+
+A filter with other parts, for example a function or arithmetic, runs in Beacon only.
+
+Lance keeps or skips full lance-nd rows:
+
+- A part on attributes is exact. All flat rows of one lance-nd row have the same attribute values.
+- A part on variables uses the stats of the table. Lance skips a lance-nd row when the stats show that no value of the row matches. Lance also skips a lance-nd row without the variable.
+- A part on variables without a stats form keeps all lance-nd rows. A table without stats has no stats form.
+- The parts combine with `AND`, `OR` and `NOT`, also when one filter has attributes and variables:
+
+```sql
+-- Lance reads the lance-nd rows of dataset 'a', and the lance-nd rows with a maximum sst above 290.
+SELECT * FROM obs WHERE ".id" = 'a' OR sst > 290;
+```
+
+The stats are the minimum and maximum value of each variable in each lance-nd row.
 lance-nd writes stats when you set `WriteOptions { stats: true, .. }` on a new table.
-With stats, a filter on variables also goes to Lance. Lance then skips the lance-nd rows that have no matching value.
-For example, `WHERE sst > 290` skips each lance-nd row with a maximum `sst` of 290 or lower.
-Lance also skips a lance-nd row without the variable.
-These variable filters use the stats: `=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN`, `AND` and `OR`, with number and string values.
-A table without stats reads all lance-nd rows.
+These variable filters use the stats: `=`, `<`, `<=`, `>`, `>=`, `BETWEEN` and `IN`, with number, string and time values.
 
-Lance keeps or skips full lance-nd rows. Beacon applies all filters again on the flat rows, so the result is always correct.
-Other filters run in Beacon only.
+Beacon applies all filters again on the flat rows, so the result is always correct.
 
 ### Options
 
