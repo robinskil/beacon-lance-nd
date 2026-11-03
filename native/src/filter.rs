@@ -1,7 +1,12 @@
-//! Translates DataFusion filters on global attribute columns into Lance SQL filters.
+//! Translates DataFusion filters into Lance SQL filters: on attribute columns, and on the
+//! stats of variables.
 
-use beacon_plugin_sdk::datafusion::common::ScalarValue;
-use beacon_plugin_sdk::datafusion::logical_expr::{BinaryExpr, Expr, Operator, expr::InList};
+use beacon_plugin_sdk::datafusion::arrow::datatypes::Schema;
+use beacon_plugin_sdk::datafusion::common::tree_node::{Transformed, TreeNode};
+use beacon_plugin_sdk::datafusion::common::{Column as DfColumn, ScalarValue};
+use beacon_plugin_sdk::datafusion::logical_expr::expr::{InList, ScalarFunction};
+use beacon_plugin_sdk::datafusion::logical_expr::{BinaryExpr, Expr, Operator};
+use lance_nd::prune::prune_filter;
 use nd_arrow_array::extension::{ATTRS_FIELD, GLOBAL_ATTRIBUTES_FIELD};
 
 use crate::schema::Column;
@@ -75,6 +80,76 @@ fn plain(name: &str) -> bool {
     identifier && !keyword
 }
 
+/// A Lance SQL filter on the stats of `table` that keeps each row that can match `expr`.
+///
+/// `None` when `expr` uses a column that is not a variable, or has no stats form.
+pub fn to_stats(expr: &Expr, columns: &[Column], table: &Schema) -> Option<String> {
+    let expr = on_variables(expr, columns)?;
+    stats_sql(&prune_filter(&expr, table).ok()??)
+}
+
+/// `true` when `expr` uses only variable columns, so the stats can prune it.
+pub fn is_variable_filter(expr: &Expr, columns: &[Column]) -> bool {
+    on_variables(expr, columns).is_some()
+}
+
+/// `expr` with unqualified columns, or `None` when it uses no column or a column that is not a
+/// variable.
+fn on_variables(expr: &Expr, columns: &[Column]) -> Option<Expr> {
+    let mut variables = 0;
+    let mut others = 0;
+    let expr = expr
+        .clone()
+        .transform(|e| match e {
+            Expr::Column(column) => {
+                if columns.contains(&Column::Variable(column.name.clone())) {
+                    variables += 1;
+                } else {
+                    others += 1;
+                }
+                let column = DfColumn::new_unqualified(column.name);
+                Ok(Transformed::yes(Expr::Column(column)))
+            }
+            e => Ok(Transformed::no(e)),
+        })
+        .ok()?
+        .data;
+    (variables > 0 && others == 0).then_some(expr)
+}
+
+/// The Lance SQL text of a stats filter from `prune_filter`.
+///
+/// The stats filter has no `NOT`, so a dropped side of an `AND` only keeps more rows.
+fn stats_sql(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Column(column) => plain(&column.name).then(|| column.name.clone()),
+        Expr::ScalarFunction(ScalarFunction { func, args }) if func.name() == "get_field" => {
+            match args.as_slice() {
+                [base, Expr::Literal(ScalarValue::Utf8(Some(name)), _)] if plain(name) => {
+                    Some(format!("{}.{name}", stats_sql(base)?))
+                }
+                _ => None,
+            }
+        }
+        Expr::Literal(value, _) => literal(value),
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) => match op {
+            Operator::And => match (stats_sql(left), stats_sql(right)) {
+                (Some(left), Some(right)) => Some(format!("({left}) AND ({right})")),
+                (Some(side), None) | (None, Some(side)) => Some(side),
+                (None, None) => None,
+            },
+            Operator::Or => Some(format!("({}) OR ({})", stats_sql(left)?, stats_sql(right)?)),
+            Operator::Eq | Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq => {
+                Some(format!("{} {op} {}", stats_sql(left)?, stats_sql(right)?))
+            }
+            _ => None,
+        },
+        Expr::IsNull(inner) => Some(format!("{} IS NULL", stats_sql(inner)?)),
+        Expr::IsNotNull(inner) => Some(format!("{} IS NOT NULL", stats_sql(inner)?)),
+        _ => None,
+    }
+}
+
 /// The Lance SQL text of a literal, or `None` for a null or an unsupported type.
 fn literal(value: &ScalarValue) -> Option<String> {
     match value {
@@ -98,7 +173,7 @@ fn literal(value: &ScalarValue) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use beacon_plugin_sdk::datafusion::common::Column as DfColumn;
+    use beacon_plugin_sdk::datafusion::arrow::datatypes::{DataType, Field, Fields};
     use beacon_plugin_sdk::datafusion::functions::string::expr_fn::upper;
     use beacon_plugin_sdk::datafusion::prelude::{col, in_list, lit};
 
@@ -188,5 +263,81 @@ mod tests {
     #[test]
     fn bare_global_attribute_name_is_not_pushed() {
         assert_eq!(lance(c("id").eq(lit("a"))), None);
+    }
+
+    /// A table schema with stats for `temperature` (Float32) and none for `label`.
+    fn stats_table() -> Schema {
+        let bounds = Fields::from(vec![
+            Field::new("min", DataType::Float32, true),
+            Field::new("max", DataType::Float32, true),
+        ]);
+        let stats = Fields::from(vec![Field::new(
+            "temperature",
+            DataType::Struct(bounds),
+            true,
+        )]);
+        Schema::new(vec![
+            Field::new("temperature", DataType::Float32, true),
+            Field::new("label", DataType::Utf8, true),
+            Field::new("__stats__", DataType::Struct(stats), true),
+        ])
+    }
+
+    fn stats(expr: Expr) -> Option<String> {
+        let columns = vec![
+            Column::Variable("temperature".into()),
+            Column::Variable("label".into()),
+            Column::Attribute("id".into()),
+        ];
+        to_stats(&expr, &columns, &stats_table())
+    }
+
+    #[test]
+    fn variable_filter_maps_to_the_stats() {
+        let text = stats(col("temperature").gt(lit(50.0f32)));
+        assert_eq!(
+            text.as_deref(),
+            Some(
+                "(__stats__.temperature IS NOT NULL) AND \
+                 ((__stats__.temperature.min IS NULL) OR (__stats__.temperature.max > 50))"
+            )
+        );
+    }
+
+    #[test]
+    fn qualified_variable_maps_to_the_stats() {
+        let expr = Expr::Column(DfColumn::new(Some("t"), "temperature")).lt(lit(5.0f32));
+        let text = stats(expr).unwrap();
+        assert!(text.contains("__stats__.temperature.min < 5"), "{text}");
+    }
+
+    #[test]
+    fn filter_with_an_attribute_has_no_stats_form() {
+        let expr = c(".id").eq(lit("a")).or(col("temperature").gt(lit(5.0f32)));
+        assert_eq!(stats(expr), None);
+    }
+
+    #[test]
+    fn variable_without_stats_has_no_stats_form() {
+        assert_eq!(stats(col("label").eq(lit("k"))), None);
+    }
+
+    #[test]
+    fn table_without_stats_has_no_stats_form() {
+        let table = Schema::new(vec![Field::new("temperature", DataType::Float32, true)]);
+        let columns = vec![Column::Variable("temperature".into())];
+        let expr = col("temperature").gt(lit(5.0f32));
+        assert_eq!(to_stats(&expr, &columns, &table), None);
+    }
+
+    #[test]
+    fn variable_filters_are_pushed() {
+        let columns = columns();
+        assert!(is_variable_filter(
+            &col("temperature").gt(lit(5.0)),
+            &columns
+        ));
+        assert!(!is_variable_filter(&c(".id").eq(lit("a")), &columns));
+        assert!(!is_variable_filter(&lit(true), &columns));
     }
 }

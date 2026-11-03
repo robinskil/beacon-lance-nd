@@ -8,7 +8,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use beacon_plugin_sdk::datafusion::arrow::datatypes::SchemaRef;
+use beacon_plugin_sdk::datafusion::arrow::datatypes::{Schema, SchemaRef};
 use beacon_plugin_sdk::datafusion::catalog::{Session, TableProvider, TableProviderFactory};
 use beacon_plugin_sdk::datafusion::common::{Result, plan_datafusion_err, plan_err};
 use beacon_plugin_sdk::datafusion::datasource::TableType as DfTableType;
@@ -25,7 +25,7 @@ use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 use lance::table::format::Fragment;
 
-use crate::filter::to_lance;
+use crate::filter::{is_variable_filter, to_lance, to_stats};
 use crate::schema::{Column, table_schema};
 use crate::stream::LanceNdPartition;
 
@@ -104,9 +104,12 @@ impl TableProvider for LanceNdTable {
         // DataFusion applies each filter again, so Lance may keep extra rows.
         Ok(filters
             .iter()
-            .map(|f| match to_lance(f, &self.columns) {
-                Some(_) => TableProviderFilterPushDown::Inexact,
-                None => TableProviderFilterPushDown::Unsupported,
+            .map(|f| {
+                if to_lance(f, &self.columns).is_some() || is_variable_filter(f, &self.columns) {
+                    TableProviderFilterPushDown::Inexact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
             })
             .collect())
     }
@@ -126,9 +129,12 @@ impl TableProvider for LanceNdTable {
             ),
             None => (Arc::clone(&self.schema), Arc::clone(&self.columns)),
         };
+        let table = Schema::from(dataset.schema());
         let pushed: Vec<String> = filters
             .iter()
-            .filter_map(|f| to_lance(f, &self.columns))
+            .filter_map(|f| {
+                to_lance(f, &self.columns).or_else(|| to_stats(f, &self.columns, &table))
+            })
             .collect();
         let filter = match pushed.len() {
             0 => None,
@@ -202,6 +208,7 @@ mod tests {
         AsArray, Int32Array, RecordBatch, RecordBatchIterator,
     };
     use beacon_plugin_sdk::datafusion::arrow::datatypes::{DataType, Field, Float64Type, Schema};
+    use beacon_plugin_sdk::datafusion::physical_plan::collect;
     use beacon_plugin_sdk::datafusion::prelude::SessionContext;
     use nd_arrow_array::Attributes;
     use std::collections::HashMap;
@@ -478,5 +485,89 @@ mod tests {
                 .all(|f| !f.name().contains("__stats__"))
         );
         assert_eq!(number(&ctx, "SELECT count(*) FROM t").await, 23.0);
+    }
+
+    /// The flat rows of the scan node alone, without the filter of DataFusion.
+    async fn scan_rows(ctx: &SessionContext, sql: &str) -> usize {
+        fn find(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+            if plan.downcast_ref::<StreamingTableExec>().is_some() {
+                return Some(Arc::clone(plan));
+            }
+            plan.children().into_iter().find_map(find)
+        }
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let scan = find(&plan).unwrap();
+        let batches = collect(scan, ctx.task_ctx()).await.unwrap();
+        batches.iter().map(|b| b.num_rows()).sum()
+    }
+
+    async fn stats_table(dir: &tempfile::TempDir) -> SessionContext {
+        let uri = write_rows_with(dir.path(), vec![row0(), row1(), row2()], true).await;
+        let ctx = session();
+        let sql = format!("CREATE EXTERNAL TABLE t STORED AS lance_nd LOCATION '{uri}'");
+        ctx.sql(&sql).await.unwrap();
+        ctx
+    }
+
+    #[tokio::test]
+    async fn stats_skip_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = stats_table(&dir).await;
+        let sql = "SELECT temperature FROM t WHERE temperature > 50";
+        // Only row 2 has a temperature above 50. Row 1 has no temperature.
+        assert_eq!(scan_rows(&ctx, sql).await, 8);
+        assert_eq!(rows(&ctx, sql).await, 8);
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let shown = scan_partitions(&plan);
+        assert!(shown.contains("__stats__.temperature.max > 50"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn stats_keep_the_whole_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = stats_table(&dir).await;
+        let sql = "SELECT temperature FROM t WHERE temperature < 5";
+        assert_eq!(scan_rows(&ctx, sql).await, 12);
+        assert_eq!(rows(&ctx, sql).await, 5);
+    }
+
+    #[tokio::test]
+    async fn stats_and_attribute_filters_combine() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = stats_table(&dir).await;
+        let sql = r#"SELECT temperature FROM t WHERE ".id" = 'c' AND temperature < 105"#;
+        assert_eq!(scan_rows(&ctx, sql).await, 8);
+        assert_eq!(rows(&ctx, sql).await, 5);
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let shown = scan_partitions(&plan);
+        assert!(shown.contains("__global_attrs__.id = 'c'"), "{shown}");
+        assert!(shown.contains("__stats__.temperature.min < 105"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn table_without_stats_keeps_all_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = table(&dir, "").await;
+        let sql = "SELECT temperature FROM t WHERE temperature > 50";
+        assert_eq!(scan_rows(&ctx, sql).await, 23);
+        assert_eq!(rows(&ctx, sql).await, 8);
     }
 }

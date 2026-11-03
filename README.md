@@ -138,8 +138,18 @@ SELECT avg(sst) FROM obs WHERE "sst.units" = 'K';
 
 A filter on attribute columns goes to Lance. Lance then reads only the rows that match.
 These filters go to Lance: `=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, `IN`, `IS NULL` and `IS NOT NULL`, with string, number and boolean values.
-Beacon applies all filters again on the flat rows. Other filters, for example on variables, run in Beacon only.
-A filter on an attribute key named `true`, `false` or `null` also runs in Beacon only.
+A filter on an attribute key named `true`, `false` or `null` runs in Beacon only.
+
+A table can have stats: the minimum and maximum value of each variable in each lance-nd row.
+lance-nd writes stats when you set `WriteOptions { stats: true, .. }` on a new table.
+With stats, a filter on variables also goes to Lance. Lance then skips the lance-nd rows that have no matching value.
+For example, `WHERE sst > 290` skips each lance-nd row with a maximum `sst` of 290 or lower.
+Lance also skips a lance-nd row without the variable.
+These variable filters use the stats: `=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN`, `AND` and `OR`, with number and string values.
+A table without stats reads all lance-nd rows.
+
+Lance keeps or skips full lance-nd rows. Beacon applies all filters again on the flat rows, so the result is always correct.
+Other filters run in Beacon only.
 
 ### Options
 
