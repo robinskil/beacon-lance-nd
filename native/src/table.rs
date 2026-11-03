@@ -24,7 +24,7 @@ use lance::Dataset;
 use lance::table::format::Fragment;
 
 use crate::filter::to_lance;
-use crate::schema::{Column, columns, table_schema};
+use crate::schema::{Column, table_schema};
 use crate::stream::LanceNdPartition;
 
 /// The option key for the number of scan partitions.
@@ -55,8 +55,9 @@ impl TableProviderFactory for LanceNdFactory {
         let dataset = Dataset::open(&uri)
             .await
             .map_err(|e| plan_datafusion_err!("lance_nd: cannot open `{uri}`: {e}"))?;
-        let schema = table_schema(&dataset).map_err(|e| e.context(format!("table `{uri}`")))?;
-        let columns = columns(&schema, &dataset).into();
+        let (schema, columns) =
+            table_schema(&dataset).map_err(|e| e.context(format!("table `{uri}`")))?;
+        let columns = columns.into();
         Ok(Arc::new(LanceNdTable {
             uri,
             schema,
@@ -203,10 +204,12 @@ mod tests {
         ctx.sql(&sql).await.unwrap();
         let schema = ctx.table("t").await.unwrap().schema().as_arrow().clone();
         let mut names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-        assert_eq!(names.pop(), Some("id"));
+        assert_eq!(names.pop(), Some(".id"));
+        assert_eq!(names.pop(), Some("temperature.units"));
         names.sort();
         assert_eq!(names, ["pressure", "temperature", "x", "y"]);
-        assert_eq!(field_type(&schema, "id"), DataType::Utf8);
+        assert_eq!(field_type(&schema, ".id"), DataType::Utf8);
+        assert_eq!(field_type(&schema, "temperature.units"), DataType::Utf8);
         assert_eq!(field_type(&schema, "temperature"), DataType::Float32);
         assert_eq!(field_type(&schema, "x"), DataType::Float64);
     }
@@ -275,7 +278,7 @@ mod tests {
     async fn projection_keeps_the_full_grid() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = table(&dir, "").await;
-        assert_eq!(rows(&ctx, "SELECT x FROM t WHERE id = 'a'").await, 12);
+        assert_eq!(rows(&ctx, r#"SELECT x FROM t WHERE ".id" = 'a'"#).await, 12);
     }
 
     #[tokio::test]
@@ -315,7 +318,7 @@ mod tests {
     async fn pushed_filter_gives_the_same_rows() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = table(&dir, "").await;
-        let sql = "SELECT count(*) FROM t WHERE id IN ('a', 'c')";
+        let sql = r#"SELECT count(*) FROM t WHERE ".id" IN ('a', 'c')"#;
         assert_eq!(number(&ctx, sql).await, 20.0);
         let plan = ctx
             .sql(sql)
@@ -344,7 +347,7 @@ mod tests {
         let ctx = session();
         let sql = format!("CREATE EXTERNAL TABLE t STORED AS lance_nd LOCATION '{uri}'");
         ctx.sql(&sql).await.unwrap();
-        let sql = r#"SELECT count(*) FROM t WHERE "null" = 'k'"#;
+        let sql = r#"SELECT count(*) FROM t WHERE ".null" = 'k'"#;
         assert_eq!(number(&ctx, sql).await, 12.0);
     }
 
@@ -360,5 +363,32 @@ mod tests {
         let sql = format!("CREATE EXTERNAL TABLE t STORED AS lance_nd LOCATION '{uri}'");
         let error = create(&sql).await;
         assert!(error.contains("plain.lance"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn filter_on_a_variable_attribute() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = table(&dir, "").await;
+        let sql = r#"SELECT count(*) FROM t WHERE "temperature.units" = 'C'"#;
+        assert_eq!(number(&ctx, sql).await, 8.0);
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let shown = scan_partitions(&plan);
+        assert!(shown.contains("temperature.attrs.units = 'C'"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn select_a_variable_attribute() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = table(&dir, "").await;
+        let sql = r#"SELECT DISTINCT "temperature.units" FROM t WHERE ".id" = 'b'"#;
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        assert_eq!(batches[0].column(0).null_count(), 1);
     }
 }

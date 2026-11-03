@@ -55,10 +55,19 @@ fn flat_column(
                 .clone(),
             None => return Ok(new_null_array(field.data_type(), cells)),
         },
-        Column::Attribute(name) => match row.attributes().get(name) {
+        Column::Attribute(key) => match row.attributes().get(key) {
             Some(value) => ScalarValue::try_from_array(value, 0)?.to_array_of_size(cells)?,
             None => return Ok(new_null_array(field.data_type(), cells)),
         },
+        Column::VariableAttribute { variable, key } => {
+            let value = row
+                .column_by_name(variable)
+                .and_then(|array| array.attributes().get(key));
+            match value {
+                Some(value) => ScalarValue::try_from_array(value, 0)?.to_array_of_size(cells)?,
+                None => return Ok(new_null_array(field.data_type(), cells)),
+            }
+        }
     };
     // A row can store a narrower type than the table, for example a smaller string type.
     if array.data_type() == field.data_type() {
@@ -89,7 +98,7 @@ mod tests {
         let fields = names.iter().map(|name| {
             let data_type = match *name {
                 "x" | "y" => DataType::Float64,
-                "id" => DataType::Utf8,
+                ".id" | "temperature.units" => DataType::Utf8,
                 _ => DataType::Float32,
             };
             Field::new(*name, data_type, true)
@@ -97,7 +106,11 @@ mod tests {
         let columns = names
             .iter()
             .map(|name| match *name {
-                "id" => Column::Attribute("id".into()),
+                ".id" => Column::Attribute("id".into()),
+                "temperature.units" => Column::VariableAttribute {
+                    variable: "temperature".into(),
+                    key: "units".into(),
+                },
                 _ => Column::Variable(name.to_string()),
             })
             .collect();
@@ -139,7 +152,7 @@ mod tests {
 
     #[test]
     fn attribute_repeats() {
-        let batch = one(&row0(), &["id"]);
+        let batch = one(&row0(), &[".id"]);
         assert_eq!(batch.num_rows(), 12);
         let id = batch
             .column(0)
@@ -179,7 +192,7 @@ mod tests {
         let row = NdRecordBatch::try_new_inferred(schema, vec![])
             .unwrap()
             .with_attributes(Attributes::new().with("id", "z"));
-        let batch = one(&row, &["x", "id"]);
+        let batch = one(&row, &["x", ".id"]);
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(batch.column(0).null_count(), 1);
         let x = batch
@@ -218,5 +231,24 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("too large"), "{error}");
+    }
+
+    #[test]
+    fn variable_attribute_repeats() {
+        let batch = one(&row0(), &["temperature.units"]);
+        assert_eq!(batch.num_rows(), 12);
+        let units = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(units.iter().all(|v| v == Some("K")));
+    }
+
+    #[test]
+    fn attribute_of_an_absent_variable_is_null() {
+        let batch = one(&row1(), &["temperature.units"]);
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.column(0).null_count(), 3);
     }
 }

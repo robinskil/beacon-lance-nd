@@ -2,7 +2,7 @@
 
 use beacon_plugin_sdk::datafusion::common::ScalarValue;
 use beacon_plugin_sdk::datafusion::logical_expr::{BinaryExpr, Expr, Operator, expr::InList};
-use nd_arrow_array::extension::GLOBAL_ATTRIBUTES_FIELD;
+use nd_arrow_array::extension::{ATTRS_FIELD, GLOBAL_ATTRIBUTES_FIELD};
 
 use crate::schema::Column;
 
@@ -55,14 +55,24 @@ fn attribute_of(expr: &Expr, columns: &[Column]) -> Option<String> {
     }
 }
 
-/// The Lance path of the global attribute `name`. A name that needs quotes stays in DataFusion.
+/// The Lance path of the attribute column `name`, or `None` for a variable or an unknown column.
 fn attribute(name: &str, columns: &[Column]) -> Option<String> {
-    let plain = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+    match columns.iter().find(|c| c.name() == name)? {
+        Column::Variable(_) => None,
+        Column::Attribute(key) => plain(key).then(|| format!("{GLOBAL_ATTRIBUTES_FIELD}.{key}")),
+        Column::VariableAttribute { variable, key } => {
+            (plain(variable) && plain(key)).then(|| format!("{variable}.{ATTRS_FIELD}.{key}"))
+        }
+    }
+}
+
+/// `true` when Lance reads `name` as a field without quotes.
+fn plain(name: &str) -> bool {
+    let identifier = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
     // Lance reads these names as literals, not as fields.
     let keyword = ["true", "false", "null"].contains(&name.to_ascii_lowercase().as_str());
-    let known = columns.contains(&Column::Attribute(name.to_string()));
-    (plain && !keyword && known).then(|| format!("{GLOBAL_ATTRIBUTES_FIELD}.{name}"))
+    identifier && !keyword
 }
 
 /// The Lance SQL text of a literal, or `None` for a null or an unsupported type.
@@ -88,15 +98,25 @@ fn literal(value: &ScalarValue) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use beacon_plugin_sdk::datafusion::common::Column as DfColumn;
     use beacon_plugin_sdk::datafusion::functions::string::expr_fn::upper;
     use beacon_plugin_sdk::datafusion::prelude::{col, in_list, lit};
 
     use super::*;
 
+    /// A column expression with `name` as it is, without a table qualifier.
+    fn c(name: &str) -> Expr {
+        Expr::Column(DfColumn::from_name(name))
+    }
+
     fn columns() -> Vec<Column> {
         vec![
             Column::Variable("temperature".into()),
             Column::Attribute("id".into()),
+            Column::VariableAttribute {
+                variable: "temperature".into(),
+                key: "units".into(),
+            },
         ]
     }
 
@@ -106,16 +126,15 @@ mod tests {
 
     #[test]
     fn equality_maps_to_the_struct_field() {
-        let text = lance(col("id").eq(lit("a")));
+        let text = lance(c(".id").eq(lit("a")));
         assert_eq!(text.as_deref(), Some("__global_attrs__.id = 'a'"));
     }
 
     #[test]
     fn comparison_and_in_list() {
-        let expr =
-            col("id")
-                .gt_eq(lit("b"))
-                .and(in_list(col("id"), vec![lit("b"), lit("c")], false));
+        let expr = c(".id")
+            .gt_eq(lit("b"))
+            .and(in_list(c(".id"), vec![lit("b"), lit("c")], false));
         assert_eq!(
             lance(expr).as_deref(),
             Some("(__global_attrs__.id >= 'b') AND (__global_attrs__.id IN ('b', 'c'))")
@@ -129,31 +148,45 @@ mod tests {
 
     #[test]
     fn quote_in_literal_is_escaped() {
-        let text = lance(col("id").eq(lit("o'brien")));
+        let text = lance(c(".id").eq(lit("o'brien")));
         assert_eq!(text.as_deref(), Some("__global_attrs__.id = 'o''brien'"));
     }
 
     #[test]
     fn other_expressions_are_not_pushed() {
-        assert_eq!(lance(upper(col("id")).eq(lit("A"))), None);
+        assert_eq!(lance(upper(c(".id")).eq(lit("A"))), None);
     }
 
     #[test]
     fn null_checks_and_not() {
-        let text = lance(!col("id").is_null());
+        let text = lance(!c(".id").is_null());
         assert_eq!(text.as_deref(), Some("NOT (__global_attrs__.id IS NULL)"));
     }
 
     #[test]
     fn literal_keyword_names_are_not_pushed() {
-        use beacon_plugin_sdk::datafusion::common::Column as DfColumn;
         let columns = vec![
             Column::Attribute("null".into()),
             Column::Attribute("True".into()),
+            Column::VariableAttribute {
+                variable: "temperature".into(),
+                key: "false".into(),
+            },
         ];
-        for name in ["null", "True"] {
-            let expr = Expr::Column(DfColumn::from_name(name)).eq(lit("k"));
+        for name in [".null", ".True", "temperature.false"] {
+            let expr = c(name).eq(lit("k"));
             assert_eq!(to_lance(&expr, &columns), None, "{name}");
         }
+    }
+
+    #[test]
+    fn variable_attribute_maps_to_attrs() {
+        let text = lance(c("temperature.units").eq(lit("K")));
+        assert_eq!(text.as_deref(), Some("temperature.attrs.units = 'K'"));
+    }
+
+    #[test]
+    fn bare_global_attribute_name_is_not_pushed() {
+        assert_eq!(lance(c("id").eq(lit("a"))), None);
     }
 }

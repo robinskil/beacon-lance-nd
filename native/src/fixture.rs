@@ -28,9 +28,10 @@ pub fn row(columns: Vec<(&str, NdArrowArray)>, id: &str) -> NdRecordBatch {
         .with_attributes(Attributes::new().with("id", id))
 }
 
-/// Row 0: `x (x=3)`, `y (y=4)`, `temperature (x=3, y=4)` and `id = "a"`. 12 cells.
+/// Row 0: `x (x=3)`, `y (y=4)`, `temperature (x=3, y=4)` with `units = "K"`, and `id = "a"`.
+/// 12 cells.
 pub fn row0() -> NdRecordBatch {
-    grid_row(&[0.0, 1.0, 2.0], 0.0, "a")
+    grid_row(&[0.0, 1.0, 2.0], 0.0, "K", "a")
 }
 
 /// Row 1: `pressure (station=3)` and `id = "b"`. 3 cells.
@@ -39,12 +40,13 @@ pub fn row1() -> NdRecordBatch {
     row(vec![("pressure", array(pressure, &[("station", 3)]))], "b")
 }
 
-/// Row 2: `x (x=2)`, `y (y=4)`, `temperature (x=2, y=4)` and `id = "c"`. 8 cells.
+/// Row 2: `x (x=2)`, `y (y=4)`, `temperature (x=2, y=4)` with `units = "C"`, and `id = "c"`.
+/// 8 cells.
 pub fn row2() -> NdRecordBatch {
-    grid_row(&[5.0, 6.0], 100.0, "c")
+    grid_row(&[5.0, 6.0], 100.0, "C", "c")
 }
 
-fn grid_row(x: &[f64], base: f32, id: &str) -> NdRecordBatch {
+fn grid_row(x: &[f64], base: f32, units: &str, id: &str) -> NdRecordBatch {
     let n = x.len();
     let y = Arc::new(Float64Array::from(vec![0.0, 1.0, 2.0, 3.0]));
     let temperature = Arc::new(Float32Array::from_iter_values(
@@ -57,7 +59,11 @@ fn grid_row(x: &[f64], base: f32, id: &str) -> NdRecordBatch {
                 array(Arc::new(Float64Array::from(x.to_vec())), &[("x", n)]),
             ),
             ("y", array(y, &[("y", 4)])),
-            ("temperature", array(temperature, &[("x", n), ("y", 4)])),
+            (
+                "temperature",
+                array(temperature, &[("x", n), ("y", 4)])
+                    .with_attributes(Attributes::new().with("units", units)),
+            ),
         ],
         id,
     )

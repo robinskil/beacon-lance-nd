@@ -19,7 +19,7 @@ INSTALL lance_nd FROM 'github:robinskil/beacon-lance-nd@v0.1.0'
 
 ```sql
 CREATE EXTERNAL TABLE obs STORED AS lance_nd LOCATION '/data/obs.lance';
-SELECT time, lat, sst FROM obs WHERE id = 'a' AND sst > 290;
+SELECT time, lat, sst, "sst.units" FROM obs WHERE ".id" = 'a' AND sst > 290;
 ```
 
 `LOCATION` is the path of the lance-nd table, or a `file://` URI.
@@ -32,19 +32,22 @@ The plugin reads the columns from the table. Do not give a column list.
 | Column | Source | Value on each flat row |
 | --- | --- | --- |
 | One column for each variable | The `nd_arrow.array` columns of the table | The value of the variable at the cell. |
-| One column for each global attribute key | The children of `__global_attrs__` | The value of the attribute. The value is the same on all flat rows of one lance-nd row. |
+| `var.key` for each attribute of a variable, for example `sst.units` | The `attrs` of the variable | The value of the attribute. The value is the same on all flat rows of one lance-nd row. |
+| `.key` for each global attribute, for example `.id` | The children of `__global_attrs__` | The value of the attribute. The value is the same on all flat rows of one lance-nd row. |
+
+These names are the same as the names of the Beacon NetCDF and Zarr readers.
+Put quotes around an attribute column in SQL: `"sst.units"` and `".id"`. Without quotes, SQL reads `sst.units` as column `units` of table `sst`.
 
 Rules:
 
 - The grid of a lance-nd row comes from all variables of that row. The column list of a query does not change the grid, so `SELECT x` and `SELECT x, sst` give the same number of rows.
-- A variable that a row does not have is null on all flat rows of that row.
+- A variable that a row does not have is null on all flat rows of that row. Its attributes are null too.
 - A row without variables gives one flat row.
-- `CREATE` fails when a global attribute key has the same name as a variable.
-- The plugin does not read `__stats__` or the attributes of each variable.
+- The plugin does not read `__stats__`.
 
 ### Filters
 
-A filter on global attribute columns goes to Lance. Lance then reads only the rows that match.
+A filter on attribute columns goes to Lance. Lance then reads only the rows that match.
 These filters go to Lance: `=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, `IN`, `IS NULL` and `IS NOT NULL`, with string, number and boolean values.
 Beacon applies all filters again on the flat rows. Other filters, for example on variables, run in Beacon only.
 A filter on an attribute key named `true`, `false` or `null` also runs in Beacon only.
