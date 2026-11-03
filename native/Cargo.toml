@@ -9,8 +9,8 @@ name = "lance_nd_native"
 crate-type = ["cdylib"]
 
 [dependencies]
-# Pin a Beacon release tag here. The tag fixes the DataFusion version.
-beacon-plugin-sdk = { git = "https://github.com/maris-development/beacon", branch = "main" }
+# The Beacon tag fixes the SDK ABI and the DataFusion version.
+beacon-plugin-sdk = { git = "https://github.com/maris-development/beacon", tag = "v2.1.0-rc2" }
 # The Lance pin must match the Lance pin of Beacon.
 lance = { version = "=11.0.0", default-features = false, features = ["aws", "azure", "gcp"] }
 lance-nd = { git = "https://github.com/robinskil/lance-nd", rev = "642d235453435b1b45173b76799c2b9e0133ef0c" }
