@@ -77,6 +77,12 @@ pub async fn write_rows(dir: &Path, rows: Vec<NdRecordBatch>) -> String {
 /// Writes one commit per row, with per-row stats when `stats` is `true`. Returns the URI.
 pub async fn write_rows_with(dir: &Path, rows: Vec<NdRecordBatch>, stats: bool) -> String {
     let uri = dir.join("table.lance").to_str().unwrap().to_string();
+    write_table(&uri, rows, stats).await;
+    uri
+}
+
+/// Writes one commit per row to the table at `uri`, with per-row stats when `stats` is `true`.
+pub async fn write_table(uri: &str, rows: Vec<NdRecordBatch>, stats: bool) {
     for (index, row) in rows.into_iter().enumerate() {
         let options = WriteOptions {
             mode: if index == 0 {
@@ -87,11 +93,23 @@ pub async fn write_rows_with(dir: &Path, rows: Vec<NdRecordBatch>, stats: bool) 
             stats,
             ..WriteOptions::default()
         };
-        lance_nd::write(&uri, stream::iter([Ok(row)]), &options)
+        lance_nd::write(uri, stream::iter([Ok(row)]), &options)
             .await
             .unwrap();
     }
-    uri
+}
+
+/// Writes the shards `a.lance` (rows 0 and 1) and `b.lance` (row 2) in `dir`. Returns the
+/// LOCATION `<dir>/*.lance`.
+pub async fn write_shards(dir: &Path) -> String {
+    write_table(
+        dir.join("a.lance").to_str().unwrap(),
+        vec![row0(), row1()],
+        false,
+    )
+    .await;
+    write_table(dir.join("b.lance").to_str().unwrap(), vec![row2()], false).await;
+    format!("{}/*.lance", dir.to_str().unwrap())
 }
 
 /// Writes the three fixture rows. Returns the URI.

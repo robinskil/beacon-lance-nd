@@ -2,15 +2,18 @@
 //!
 //! `CREATE EXTERNAL TABLE t STORED AS lance_nd LOCATION '<uri>'` opens the lance-nd table at `<uri>`.
 //! The columns are the variables of the table, then the keys of its global attributes.
+//! A wildcard in the last path segment of `<uri>` reads each matching lance-nd table as a shard.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use beacon_plugin_sdk::datafusion::arrow::datatypes::SchemaRef;
+use beacon_plugin_sdk::datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use beacon_plugin_sdk::datafusion::catalog::{Session, TableProvider, TableProviderFactory};
-use beacon_plugin_sdk::datafusion::common::{Result, plan_datafusion_err, plan_err};
+use beacon_plugin_sdk::datafusion::common::{
+    DataFusionError, Result, plan_datafusion_err, plan_err,
+};
 use beacon_plugin_sdk::datafusion::datasource::TableType as DfTableType;
 use beacon_plugin_sdk::datafusion::logical_expr::{
     CreateExternalTable, Expr, TableProviderFilterPushDown,
@@ -21,13 +24,18 @@ use beacon_plugin_sdk::datafusion::physical_plan::streaming::{
     PartitionStream, StreamingTableExec,
 };
 use beacon_plugin_sdk::table_type::{TableType, table_option};
+use futures::{StreamExt, TryStreamExt, stream};
 use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 use lance::table::format::Fragment;
 
 use crate::filter::to_lance;
-use crate::schema::{Column, table_schema};
-use crate::stream::LanceNdPartition;
+use crate::schema::{Column, SHARD_COLUMN, merge_schemas, table_schema};
+use crate::shard::{expand, has_wildcard};
+use crate::stream::{LanceNdPartition, ShardPart};
+
+/// The most shards that a CREATE or a scan opens at the same time.
+const OPEN_AT_ONCE: usize = 16;
 
 /// The option key for the number of scan partitions.
 const PARTITIONS: &str = "partitions";
@@ -53,25 +61,67 @@ impl TableProviderFactory for LanceNdFactory {
                 _ => return plan_err!("lance_nd: {PARTITIONS} must be 1 to 512, not `{text}`"),
             },
         };
-        let uri = cmd.location.clone();
+        let location = cmd.location.clone();
         let storage = storage_options(&cmd.options);
-        let dataset = open(&uri, &storage).await?;
-        let (schema, columns) =
-            table_schema(&dataset).map_err(|e| e.context(format!("table `{uri}`")))?;
-        let columns = columns.into();
+        let sharded = has_wildcard(&location);
+        let found = expand(&location, &storage).await?;
+        let schemas: Vec<(String, SchemaRef, Vec<Column>)> = stream::iter(found.clone())
+            .map(|(name, uri)| {
+                let storage = storage.clone();
+                async move {
+                    let dataset = open(&uri, &storage).await?;
+                    let (schema, columns) =
+                        table_schema(&dataset).map_err(|e| e.context(format!("table `{uri}`")))?;
+                    Ok::<_, DataFusionError>((name, schema, columns))
+                }
+            })
+            .buffered(OPEN_AT_ONCE)
+            .try_collect()
+            .await?;
+        let (schema, mut columns) = merge_schemas(&schemas)?;
+        let mut fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+        if sharded {
+            let reserved = schemas
+                .iter()
+                .find(|(_, _, columns)| columns.iter().any(|c| c.name() == SHARD_COLUMN));
+            if let Some((name, _, _)) = reserved {
+                return plan_err!(
+                    "lance_nd: `{SHARD_COLUMN}` is reserved in a sharded table, and shard {name} has a column with this name"
+                );
+            }
+            fields.push(Field::new(SHARD_COLUMN, DataType::Utf8, false));
+            columns.push(Column::Shard);
+        }
+        let shards = found
+            .into_iter()
+            .zip(schemas)
+            .map(|((name, uri), (_, _, columns))| Shard { name, uri, columns })
+            .collect();
         Ok(Arc::new(LanceNdTable {
-            uri,
+            location,
+            shards,
             storage,
-            schema,
-            columns,
+            schema: Arc::new(Schema::new(fields)),
+            columns: columns.into(),
             partitions,
         }))
     }
 }
 
-/// A lance-nd table. Each scan opens the latest version.
+/// One lance-nd table of a `lance_nd` table.
+#[derive(Debug, Clone)]
+pub struct Shard {
+    /// The last path segment of the shard, the value of `__shard`.
+    pub name: String,
+    pub uri: String,
+    /// The columns of this shard at CREATE.
+    pub columns: Vec<Column>,
+}
+
+/// A lance-nd table, or a set of shards. Each scan opens the latest version of each shard.
 pub struct LanceNdTable {
-    uri: String,
+    location: String,
+    shards: Vec<Shard>,
     /// Lance storage options, for example the credentials of an object store.
     storage: HashMap<String, String>,
     schema: SchemaRef,
@@ -82,7 +132,7 @@ pub struct LanceNdTable {
 impl fmt::Debug for LanceNdTable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LanceNdTable")
-            .field("uri", &self.uri)
+            .field("location", &self.location)
             .finish()
     }
 }
@@ -118,7 +168,15 @@ impl TableProvider for LanceNdTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let dataset = Arc::new(open(&self.uri, &self.storage).await?);
+        let uris: Vec<String> = self.shards.iter().map(|shard| shard.uri.clone()).collect();
+        let datasets: Vec<Arc<Dataset>> = stream::iter(uris)
+            .map(|uri| {
+                let storage = self.storage.clone();
+                async move { open(&uri, &storage).await.map(Arc::new) }
+            })
+            .buffered(OPEN_AT_ONCE)
+            .try_collect()
+            .await?;
         let (schema, columns): (SchemaRef, Arc<[Column]>) = match projection {
             Some(indices) => (
                 Arc::new(self.schema.project(indices)?),
@@ -126,20 +184,55 @@ impl TableProvider for LanceNdTable {
             ),
             None => (Arc::clone(&self.schema), Arc::clone(&self.columns)),
         };
-        let filter = filters
+        let read = variables_to_read(&columns);
+        let parts: Vec<ShardPart> = self
+            .shards
             .iter()
-            .filter_map(|f| to_lance(f, &self.columns))
-            .reduce(Expr::and);
+            .zip(&datasets)
+            .map(|(shard, dataset)| ShardPart {
+                name: Arc::from(shard.name.as_str()),
+                dataset: Arc::clone(dataset),
+                fragments: Vec::new(),
+                // A shard without a column of a filter does not get that filter.
+                filter: filters
+                    .iter()
+                    .filter_map(|f| to_lance(f, &shard.columns))
+                    .reduce(Expr::and),
+                read: read
+                    .iter()
+                    .filter(|name| shard.columns.contains(&Column::Variable(name.to_string())))
+                    .cloned()
+                    .collect(),
+            })
+            .collect();
+        let items: Vec<(usize, Fragment)> = datasets
+            .iter()
+            .enumerate()
+            .flat_map(|(index, dataset)| {
+                dataset.fragments().iter().map(move |f| (index, f.clone()))
+            })
+            .collect();
         let count = self
             .partitions
             .unwrap_or_else(|| state.config().target_partitions());
-        let partitions = fragment_groups(dataset.fragments(), count)
+        let partitions = fragment_groups(items, count)
             .into_iter()
-            .map(|fragments| {
+            .map(|group| {
+                let mut own: Vec<ShardPart> = Vec::new();
+                for (index, fragment) in group {
+                    // Each group is sorted by shard, so a new shard starts a new part.
+                    match own.last_mut() {
+                        Some(part) if Arc::ptr_eq(&part.dataset, &datasets[index]) => {
+                            part.fragments.push(fragment)
+                        }
+                        _ => own.push(ShardPart {
+                            fragments: vec![fragment],
+                            ..parts[index].clone()
+                        }),
+                    }
+                }
                 Arc::new(LanceNdPartition {
-                    dataset: Arc::clone(&dataset),
-                    fragments,
-                    filter: filter.clone(),
+                    parts: own,
                     schema: Arc::clone(&schema),
                     columns: Arc::clone(&columns),
                 }) as Arc<dyn PartitionStream>
@@ -157,14 +250,35 @@ impl TableProvider for LanceNdTable {
     }
 }
 
-/// `fragments` round robin over at most `count` groups. Always at least one group.
-fn fragment_groups(fragments: &[Fragment], count: usize) -> Vec<Vec<Fragment>> {
-    let mut groups = vec![Vec::new(); count.min(fragments.len()).max(1)];
+/// `items` round robin over at most `count` groups, each group sorted by shard. Always at least
+/// one group.
+fn fragment_groups(items: Vec<(usize, Fragment)>, count: usize) -> Vec<Vec<(usize, Fragment)>> {
+    let mut groups = vec![Vec::new(); count.min(items.len()).max(1)];
     let len = groups.len();
-    for (index, fragment) in fragments.iter().enumerate() {
-        groups[index % len].push(fragment.clone());
+    for (index, item) in items.into_iter().enumerate() {
+        groups[index % len].push(item);
+    }
+    for group in &mut groups {
+        group.sort_by_key(|(shard, _)| *shard);
     }
     groups
+}
+
+/// The variables that `columns` read: each variable, and each variable with a selected
+/// attribute. Each name comes once, in column order.
+fn variables_to_read(columns: &[Column]) -> Vec<String> {
+    let mut read: Vec<String> = Vec::new();
+    for column in columns {
+        let name = match column {
+            Column::Variable(name) => name,
+            Column::VariableAttribute { variable, .. } => variable,
+            Column::Attribute(_) | Column::Shard => continue,
+        };
+        if !read.contains(name) {
+            read.push(name.clone());
+        }
+    }
+    read
 }
 
 /// The table options that go to Lance as storage options.
@@ -206,6 +320,7 @@ mod tests {
 
     use crate::fixture::{
         field_type, row, row0, row1, row2, session, write_fixture, write_rows, write_rows_with,
+        write_shards, write_table,
     };
 
     async fn create(sql: &str) -> String {
@@ -628,5 +743,144 @@ mod tests {
             assert_eq!(scan_rows(&ctx, sql).await, scanned, "{sql}");
             assert_eq!(number(&ctx, sql).await, count, "{sql}");
         }
+    }
+
+    async fn shard_table(location: &str, options: &str) -> SessionContext {
+        let ctx = session();
+        let sql =
+            format!("CREATE EXTERNAL TABLE t STORED AS lance_nd LOCATION '{location}' {options}");
+        ctx.sql(&sql).await.unwrap();
+        ctx
+    }
+
+    /// The first `StreamingTableExec` in `plan`.
+    fn scan_exec(plan: &Arc<dyn ExecutionPlan>) -> Option<&StreamingTableExec> {
+        if let Some(exec) = plan.downcast_ref::<StreamingTableExec>() {
+            return Some(exec);
+        }
+        plan.children().into_iter().find_map(scan_exec)
+    }
+
+    #[tokio::test]
+    async fn shards_read_as_one_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = shard_table(&write_shards(dir.path()).await, "").await;
+        assert_eq!(number(&ctx, "SELECT count(*) FROM t").await, 3.0);
+        assert_eq!(
+            number(&ctx, "SELECT sum(temperature) FROM t").await,
+            66.0 + 828.0
+        );
+        let sql = r#"SELECT "__shard", count(*) FROM t GROUP BY 1 ORDER BY 1"#;
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let batch = &batches[0];
+        let shards: Vec<String> = (0..batch.num_rows())
+            .map(|i| batch.column(0).as_string::<i32>().value(i).to_string())
+            .collect();
+        assert_eq!(shards, ["a.lance", "b.lance"]);
+        let counts = batch
+            .column(1)
+            .as_primitive::<beacon_plugin_sdk::datafusion::arrow::datatypes::Int64Type>();
+        assert_eq!(counts.values().to_vec(), [2, 1]);
+    }
+
+    #[tokio::test]
+    async fn columns_of_one_shard_are_null_in_the_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| dir.path().join(name).to_str().unwrap().to_string();
+        write_table(&path("a.lance"), vec![row0(), row1()], false).await;
+        let attributes = Attributes::new().with("id", "c").with("station", "s1");
+        write_table(
+            &path("b.lance"),
+            vec![row2().with_attributes(attributes)],
+            false,
+        )
+        .await;
+        let location = format!("{}/*.lance", dir.path().to_str().unwrap());
+        let ctx = shard_table(&location, "").await;
+        assert_eq!(
+            number(&ctx, r#"SELECT count(".station") FROM t"#).await,
+            1.0
+        );
+        assert_eq!(number(&ctx, "SELECT count(*) FROM t").await, 3.0);
+    }
+
+    #[tokio::test]
+    async fn filter_on_a_column_of_one_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = shard_table(&write_shards(dir.path()).await, "").await;
+        // `pressure` is in a.lance only. Row 1 has the pressures 1, 2 and 3.
+        assert_eq!(
+            number(&ctx, "SELECT count(*) FROM t WHERE pressure > 1").await,
+            2.0
+        );
+        // a.lance: row 0 (one cell, no pressure) and row 1 (3 cells). b.lance gets no filter: one cell.
+        assert_eq!(
+            scan_rows(&ctx, "SELECT count(*) FROM t WHERE pressure > 1").await,
+            1 + 3 + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn partitions_spread_fragments_of_all_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = write_shards(dir.path()).await;
+        let ctx = shard_table(&location, "OPTIONS ('partitions' '3')").await;
+        let sql = "SELECT count(*) FROM t";
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        assert_eq!(scan_exec(&plan).unwrap().partitions().len(), 3);
+        assert_eq!(number(&ctx, sql).await, 3.0);
+        assert_eq!(
+            number(&ctx, "SELECT sum(temperature) FROM t").await,
+            66.0 + 828.0
+        );
+    }
+
+    #[tokio::test]
+    async fn stray_match_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = write_shards(dir.path()).await;
+        std::fs::create_dir(dir.path().join("c.lance")).unwrap();
+        std::fs::write(dir.path().join("c.lance").join("notes.txt"), b"x").unwrap();
+        let sql = format!("CREATE EXTERNAL TABLE t STORED AS lance_nd LOCATION '{location}'");
+        let error = create(&sql).await;
+        assert!(error.contains("c.lance"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn reserved_shard_name_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| dir.path().join(name).to_str().unwrap().to_string();
+        write_table(&path("a.lance"), vec![row0()], false).await;
+        let values =
+            Arc::new(beacon_plugin_sdk::datafusion::arrow::array::Float64Array::from(vec![1.0]));
+        let shard =
+            NdArrowArray::try_new(values, Dimensions::try_new([("n", 1)]).unwrap()).unwrap();
+        write_table(
+            &path("b.lance"),
+            vec![row(vec![("__shard", shard)], "z")],
+            false,
+        )
+        .await;
+        let location = format!("{}/*.lance", dir.path().to_str().unwrap());
+        let sql = format!("CREATE EXTERNAL TABLE t STORED AS lance_nd LOCATION '{location}'");
+        let error = create(&sql).await;
+        assert!(
+            error.contains("__shard") && error.contains("reserved"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_location_has_no_shard_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = table(&dir, "").await;
+        let schema = ctx.table("t").await.unwrap().schema().as_arrow().clone();
+        assert!(schema.field_with_name("__shard").is_err());
     }
 }
