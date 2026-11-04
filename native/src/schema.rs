@@ -5,7 +5,9 @@
 
 use std::sync::Arc;
 
-use beacon_plugin_sdk::datafusion::arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
+use beacon_plugin_sdk::datafusion::arrow::datatypes::{
+    DataType, Field, Fields, Schema, SchemaRef, TimeUnit,
+};
 use beacon_plugin_sdk::datafusion::common::{Result, plan_datafusion_err, plan_err};
 use lance::Dataset;
 use nd_arrow_array::extension::{ATTRS_FIELD, GLOBAL_ATTRIBUTES_FIELD};
@@ -94,12 +96,104 @@ fn struct_child(data_type: &DataType, name: &str) -> Option<Fields> {
     struct_fields(child.data_type())
 }
 
+/// The table option that lets [`merge_schemas`] widen the type of a column.
+pub const WIDEN_TYPES: &str = "widen_types";
+
+/// The type that holds the values of both `a` and `b` with no loss, or `None`.
+pub fn widen(a: &DataType, b: &DataType) -> Option<DataType> {
+    use DataType::*;
+    // The bits of an integer type, and `true` when it is signed.
+    let int = |t: &DataType| match t {
+        Int8 => Some((8, true)),
+        Int16 => Some((16, true)),
+        Int32 => Some((32, true)),
+        Int64 => Some((64, true)),
+        UInt8 => Some((8, false)),
+        UInt16 => Some((16, false)),
+        UInt32 => Some((32, false)),
+        UInt64 => Some((64, false)),
+        _ => None,
+    };
+    let float_bits = |t: &DataType| match t {
+        Float16 => Some(16),
+        Float32 => Some(32),
+        Float64 => Some(64),
+        _ => None,
+    };
+    let signed = |bits: u32| match bits {
+        8 => Some(Int8),
+        16 => Some(Int16),
+        32 => Some(Int32),
+        64 => Some(Int64),
+        _ => None,
+    };
+    let unsigned = |bits: u32| match bits {
+        8 => Some(UInt8),
+        16 => Some(UInt16),
+        32 => Some(UInt32),
+        64 => Some(UInt64),
+        _ => None,
+    };
+    let string = |t: &DataType| matches!(t, Utf8 | LargeUtf8 | Utf8View);
+    let unit_rank = |unit: &TimeUnit| match unit {
+        TimeUnit::Second => 0,
+        TimeUnit::Millisecond => 1,
+        TimeUnit::Microsecond => 2,
+        TimeUnit::Nanosecond => 3,
+    };
+    if a == b {
+        return Some(a.clone());
+    }
+    match (a, b) {
+        _ if string(a) && string(b) => Some(Utf8),
+        (Timestamp(ua, za), Timestamp(ub, zb)) if za == zb => {
+            let unit = if unit_rank(ua) >= unit_rank(ub) {
+                ua
+            } else {
+                ub
+            };
+            Some(Timestamp(*unit, za.clone()))
+        }
+        _ => match (int(a), int(b), float_bits(a), float_bits(b)) {
+            (Some((ba, sa)), Some((bb, sb)), _, _) if sa == sb => match sa {
+                true => signed(ba.max(bb)),
+                false => unsigned(ba.max(bb)),
+            },
+            // A signed type needs one more bit than the unsigned width.
+            (Some((ba, sa)), Some((bb, _)), _, _) => {
+                let (unsigned_bits, signed_bits) = if sa { (bb, ba) } else { (ba, bb) };
+                signed((unsigned_bits * 2).max(signed_bits))
+            }
+            (_, _, Some(fa), Some(fb)) => float_bits_type(fa.max(fb)),
+            // A float64 holds each integer of at most 32 bits exactly.
+            (Some((bits, _)), None, None, Some(_)) | (None, Some((bits, _)), Some(_), None)
+                if bits <= 32 =>
+            {
+                Some(Float64)
+            }
+            _ => None,
+        },
+    }
+}
+
+/// The float type of `bits` bits.
+fn float_bits_type(bits: u32) -> Option<DataType> {
+    match bits {
+        16 => Some(DataType::Float16),
+        32 => Some(DataType::Float32),
+        64 => Some(DataType::Float64),
+        _ => None,
+    }
+}
+
 /// The union of the shard schemas, by column name. Each tuple is a shard name, its schema and its
 /// columns. Within each group (variables, attributes of variables, global attributes), the
 /// columns keep the order of first appearance. Each field is nullable, because a column can be
-/// absent in a shard.
+/// absent in a shard. With `widen_types`, a column with two types gets the type of [`widen`] when it
+/// has one.
 pub fn merge_schemas(
     shards: &[(String, SchemaRef, Vec<Column>)],
+    widen_types: bool,
 ) -> Result<(SchemaRef, Vec<Column>)> {
     // Per group: the column, its type and the first shard that has it.
     let mut groups: [Vec<(Column, DataType, &str)>; 3] = Default::default();
@@ -111,7 +205,7 @@ pub fn merge_schemas(
     for (shard, schema, columns) in shards {
         for (field, column) in schema.fields().iter().zip(columns) {
             let seen = groups
-                .iter()
+                .iter_mut()
                 .flatten()
                 .find(|(c, _, _)| c.name() == column.name());
             match seen {
@@ -127,11 +221,22 @@ pub fn merge_schemas(
                     );
                 }
                 Some((_, data_type, first)) if data_type != field.data_type() => {
-                    return plan_err!(
-                        "lance_nd: column `{}` is {data_type} in shard {first} and {} in shard {shard}",
-                        column.name(),
-                        field.data_type()
-                    );
+                    match (widen(data_type, field.data_type()), widen_types) {
+                        (Some(wider), true) => *data_type = wider,
+                        (wider, _) => {
+                            let hint = match wider {
+                                Some(wider) => format!(
+                                    ". Set OPTIONS ('{WIDEN_TYPES}' 'true') to read both as {wider}"
+                                ),
+                                None => String::new(),
+                            };
+                            return plan_err!(
+                                "lance_nd: column `{}` is {data_type} in shard {first} and {} in shard {shard}{hint}",
+                                column.name(),
+                                field.data_type()
+                            );
+                        }
+                    }
                 }
                 Some(_) => {}
             }
@@ -236,7 +341,7 @@ mod tests {
                 (global("station"), DataType::Utf8),
             ],
         );
-        let (schema, columns) = merge_schemas(&[a, b]).unwrap();
+        let (schema, columns) = merge_schemas(&[a, b], false).unwrap();
         let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(
             names,
@@ -258,7 +363,7 @@ mod tests {
     fn type_conflict_names_both_shards() {
         let a = shard("a.lance", vec![(var("x"), DataType::Float64)]);
         let b = shard("b.lance", vec![(var("x"), DataType::Utf8)]);
-        let error = merge_schemas(&[a, b]).unwrap_err().to_string();
+        let error = merge_schemas(&[a, b], false).unwrap_err().to_string();
         for part in ["`x`", "a.lance", "b.lance", "Float64", "Utf8"] {
             assert!(error.contains(part), "{part}: {error}");
         }
@@ -268,9 +373,82 @@ mod tests {
     fn source_conflict_is_an_error() {
         let a = shard("a.lance", vec![(var_attr("a", "b"), DataType::Utf8)]);
         let b = shard("b.lance", vec![(var("a.b"), DataType::Utf8)]);
-        let error = merge_schemas(&[a, b]).unwrap_err().to_string();
+        let error = merge_schemas(&[a, b], false).unwrap_err().to_string();
         assert!(
             error.contains("`a.b`") && error.contains("b.lance"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn widen_rules() {
+        use DataType::*;
+        use beacon_plugin_sdk::datafusion::arrow::datatypes::TimeUnit::{Nanosecond, Second};
+        let utc = Some("UTC".into());
+        let cases: Vec<(DataType, DataType, Option<DataType>)> = vec![
+            (Float32, Float64, Some(Float64)),
+            (Float16, Float32, Some(Float32)),
+            (Int32, Int64, Some(Int64)),
+            (UInt8, UInt32, Some(UInt32)),
+            (UInt8, Int8, Some(Int16)),
+            (UInt32, Int16, Some(Int64)),
+            (UInt64, Int64, None),
+            (Int32, Float32, Some(Float64)),
+            (UInt32, Float64, Some(Float64)),
+            (Int64, Float64, None),
+            (Utf8, LargeUtf8, Some(Utf8)),
+            (Utf8View, LargeUtf8, Some(Utf8)),
+            (
+                Timestamp(Second, None),
+                Timestamp(Nanosecond, None),
+                Some(Timestamp(Nanosecond, None)),
+            ),
+            (
+                Timestamp(Nanosecond, utc.clone()),
+                Timestamp(Nanosecond, None),
+                None,
+            ),
+            (
+                Timestamp(Second, utc.clone()),
+                Timestamp(Nanosecond, utc.clone()),
+                Some(Timestamp(Nanosecond, utc)),
+            ),
+            (Utf8, Float64, None),
+            (Boolean, Int8, None),
+        ];
+        for (a, b, expected) in cases {
+            assert_eq!(widen(&a, &b), expected, "{a} + {b}");
+            assert_eq!(widen(&b, &a), expected, "{b} + {a}");
+        }
+    }
+
+    #[test]
+    fn widened_merge_takes_the_wider_type() {
+        let a = shard("a.lance", vec![(var("x"), DataType::Int8)]);
+        let b = shard("b.lance", vec![(var("x"), DataType::Int16)]);
+        let c = shard("c.lance", vec![(var("x"), DataType::Int32)]);
+        let (schema, _) = merge_schemas(&[a, b, c], true).unwrap();
+        assert_eq!(schema.field(0).data_type(), &DataType::Int32);
+    }
+
+    #[test]
+    fn widened_merge_keeps_real_conflicts() {
+        let a = shard("a.lance", vec![(var("x"), DataType::Float64)]);
+        let b = shard("b.lance", vec![(var("x"), DataType::Utf8)]);
+        let error = merge_schemas(&[a, b], true).unwrap_err().to_string();
+        assert!(
+            error.contains("a.lance") && error.contains("b.lance"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn strict_merge_names_the_option() {
+        let a = shard("a.lance", vec![(var("x"), DataType::Float32)]);
+        let b = shard("b.lance", vec![(var("x"), DataType::Float64)]);
+        let error = merge_schemas(&[a, b], false).unwrap_err().to_string();
+        assert!(
+            error.contains("widen_types") && error.contains("Float64"),
             "{error}"
         );
     }

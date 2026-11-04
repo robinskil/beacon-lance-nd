@@ -112,11 +112,33 @@ Shards let each writer write its own table, for example one table for each data 
 | No entry matches | `CREATE` fails. |
 | An entry matches but is not a lance-nd table | `CREATE` fails and names that entry. |
 | A column in some shards only | The column is in the table. It is null for the rows of the other shards. |
-| Same column name with different types in two shards | `CREATE` fails and names the column, both shards and both types. |
+| Same column name with different types in two shards | `CREATE` fails and names the column, both shards and both types. With `widen_types`, the column gets one wider type when a wider type exists. See below. |
 | A variable named `__shard` in a shard | `CREATE` fails. `__shard` is reserved in a sharded table. |
 | A filter uses a column that a shard does not have | That filter does not go to Lance for that shard. Beacon applies it on the flat rows. |
 | A shard is gone after `CREATE` | A query that reads the shard fails and names it. |
 | `partitions` option | The plugin divides the fragments of all shards between the partitions. |
+
+#### Different types in shards
+
+By default, a column must have the same type in each shard. Set `widen_types` to read a column with different types as one wider type. The wider type holds each value with no loss.
+
+```sql
+CREATE EXTERNAL TABLE argo STORED AS lance_nd LOCATION '/data/argo/*.lance'
+OPTIONS ('widen_types' 'true');
+```
+
+| Types in the shards | Type in the table |
+| --- | --- |
+| Two signed integers, or two unsigned integers | The wider type, for example `Int32` and `Int64` give `Int64`. |
+| A signed and an unsigned integer | The smallest signed type that holds both, for example `UInt8` and `Int8` give `Int16`. `UInt64` with a signed type fails. |
+| Two floats | The wider float, for example `Float32` and `Float64` give `Float64`. |
+| An integer of at most 32 bits and a float | `Float64`. |
+| `Utf8`, `LargeUtf8` and `Utf8View` | `Utf8`. |
+| Timestamps with the same time zone and different units | The finer unit, for example seconds and nanoseconds give nanoseconds. |
+| All other pairs, for example a 64-bit integer and a float, two time zones, or a number and a string | `CREATE` fails. |
+
+The plugin casts each value to the table type when it reads it. Filters still go to Lance for each shard.
+A nanosecond timestamp holds the years 1677 to 2262 only. A value in seconds outside that range gives an error when the plugin reads it.
 
 ### Columns
 
@@ -216,6 +238,7 @@ Beacon applies all filters again on the flat rows, so the result is always corre
 | Option | Default | Description |
 | --- | --- | --- |
 | `partitions` | The `target_partitions` of the session | The number of scan partitions, from 1 to 512. The plugin divides the Lance fragments between the partitions. |
+| `widen_types` | `false` | `true` or `false`. With `true`, a column with different types in two shards gets one wider type. See [Different types in shards](#different-types-in-shards). |
 
 ```sql
 CREATE EXTERNAL TABLE obs STORED AS lance_nd LOCATION '/data/obs.lance' OPTIONS ('partitions' '8');

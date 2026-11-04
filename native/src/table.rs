@@ -33,7 +33,7 @@ use lance::dataset::builder::DatasetBuilder;
 use lance::table::format::Fragment;
 
 use crate::filter::to_lance;
-use crate::schema::{Column, SHARD_COLUMN, merge_schemas, table_schema};
+use crate::schema::{Column, SHARD_COLUMN, WIDEN_TYPES, merge_schemas, table_schema};
 use crate::shard::{expand, has_wildcard};
 use crate::stream::{LanceNdPartition, ShardPart};
 
@@ -64,6 +64,14 @@ impl TableProviderFactory for LanceNdFactory {
                 _ => return plan_err!("lance_nd: {PARTITIONS} must be 1 to 512, not `{text}`"),
             },
         };
+        let widen_types = match table_option(cmd, WIDEN_TYPES).map(|t| t.to_ascii_lowercase()) {
+            None => false,
+            Some(text) if text == "true" => true,
+            Some(text) if text == "false" => false,
+            Some(text) => {
+                return plan_err!("lance_nd: {WIDEN_TYPES} must be true or false, not `{text}`");
+            }
+        };
         let location = cmd.location.clone();
         let storage = storage_options(&cmd.options);
         let sharded = has_wildcard(&location);
@@ -81,7 +89,7 @@ impl TableProviderFactory for LanceNdFactory {
             .buffered(OPEN_AT_ONCE)
             .try_collect()
             .await?;
-        let (schema, mut columns) = merge_schemas(&schemas)?;
+        let (schema, mut columns) = merge_schemas(&schemas, widen_types)?;
         let mut fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
         if sharded {
             let reserved = schemas
@@ -343,7 +351,7 @@ pub fn storage_options(options: &HashMap<String, String>) -> HashMap<String, Str
     options
         .iter()
         .map(|(key, value)| (key.strip_prefix("format.").unwrap_or(key), value))
-        .filter(|(key, _)| *key != PARTITIONS)
+        .filter(|(key, _)| *key != PARTITIONS && *key != WIDEN_TYPES)
         .map(|(key, value)| (key.to_string(), value.clone()))
         .collect()
 }
@@ -631,6 +639,7 @@ mod tests {
         let options = HashMap::from([
             ("format.aws_region".to_string(), "eu-west-1".to_string()),
             ("format.partitions".to_string(), "4".to_string()),
+            ("format.widen_types".to_string(), "true".to_string()),
             ("aws_endpoint".to_string(), "http://minio:9000".to_string()),
         ]);
         let storage = storage_options(&options);
@@ -1012,5 +1021,119 @@ mod tests {
             .to_string();
         assert!(error.contains("no common grid"), "{error}");
         assert!(error.contains("a.lance"), "{error}");
+    }
+
+    /// Shards with stats and `temperature` as Float32 (a.lance, row 0) and as Float64 (b.lance: 100, 101).
+    async fn mixed_type_shards(dir: &tempfile::TempDir) -> String {
+        let path = |name: &str| dir.path().join(name).to_str().unwrap().to_string();
+        write_table(&path("a.lance"), vec![row0()], true).await;
+        let values = Arc::new(
+            beacon_plugin_sdk::datafusion::arrow::array::Float64Array::from(vec![100.0, 101.0]),
+        );
+        let temperature =
+            NdArrowArray::try_new(values, Dimensions::try_new([("x", 2)]).unwrap()).unwrap();
+        write_table(
+            &path("b.lance"),
+            vec![row(vec![("temperature", temperature)], "c")],
+            true,
+        )
+        .await;
+        format!("{}/*.lance", dir.path().to_str().unwrap())
+    }
+
+    #[tokio::test]
+    async fn mixed_types_fail_without_widening() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = mixed_type_shards(&dir).await;
+        let sql = format!("CREATE EXTERNAL TABLE t STORED AS lance_nd LOCATION '{location}'");
+        let error = create(&sql).await;
+        assert!(
+            error.contains("widen_types") && error.contains("temperature"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn widened_shards_read_as_one_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = mixed_type_shards(&dir).await;
+        let ctx = shard_table(&location, "OPTIONS ('widen_types' 'true')").await;
+        let schema = ctx.table("t").await.unwrap().schema().as_arrow().clone();
+        assert_eq!(field_type(&schema, "temperature"), DataType::Float64);
+        assert_eq!(
+            number(&ctx, "SELECT sum(temperature) FROM t").await,
+            66.0 + 201.0
+        );
+        // Lance gets a Float64 literal for the Float32 shard and for the Float64 shard.
+        let sql = "SELECT count(*) FROM t WHERE temperature > 10.5";
+        assert_eq!(number(&ctx, sql).await, 1.0 + 2.0);
+        let sql = "SELECT count(*) FROM t WHERE temperature > 100.5";
+        assert_eq!(number(&ctx, sql).await, 1.0);
+        assert_eq!(scan_rows(&ctx, sql).await, 2);
+    }
+
+    #[tokio::test]
+    async fn widen_types_must_be_true_or_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = write_shards(dir.path()).await;
+        let sql = format!(
+            "CREATE EXTERNAL TABLE t STORED AS lance_nd LOCATION '{location}' OPTIONS ('widen_types' 'yes')"
+        );
+        let error = create(&sql).await;
+        assert!(
+            error.contains("widen_types must be true or false"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn widened_timestamps_filter_both_shards() {
+        use beacon_plugin_sdk::datafusion::arrow::array::TimestampSecondArray;
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| dir.path().join(name).to_str().unwrap().to_string();
+        let dims = || Dimensions::try_new([("time", 2)]).unwrap();
+        let seconds =
+            NdArrowArray::try_new(Arc::new(TimestampSecondArray::from(vec![100, 200])), dims())
+                .unwrap();
+        let second = 1_000_000_000;
+        let nanos = NdArrowArray::try_new(
+            Arc::new(TimestampNanosecondArray::from(vec![
+                1000 * second,
+                2000 * second,
+            ])),
+            dims(),
+        )
+        .unwrap();
+        write_table(
+            &path("a.lance"),
+            vec![row(vec![("time", seconds)], "a")],
+            true,
+        )
+        .await;
+        write_table(
+            &path("b.lance"),
+            vec![row(vec![("time", nanos)], "b")],
+            true,
+        )
+        .await;
+        let location = format!("{}/*.lance", dir.path().to_str().unwrap());
+        let ctx = shard_table(&location, "OPTIONS ('widen_types' 'true')").await;
+        let schema = ctx.table("t").await.unwrap().schema().as_arrow().clone();
+        assert!(
+            matches!(
+                field_type(&schema, "time"),
+                DataType::Timestamp(
+                    beacon_plugin_sdk::datafusion::arrow::datatypes::TimeUnit::Nanosecond,
+                    None
+                )
+            ),
+            "{schema:?}"
+        );
+        let sql = "SELECT count(*) FROM t WHERE time > TIMESTAMP '1970-01-01T00:02:30'";
+        // a.lance: 200 s matches. b.lance: both values match.
+        assert_eq!(number(&ctx, sql).await, 3.0);
+        let sql = "SELECT count(*) FROM t WHERE time > TIMESTAMP '1970-01-01T00:08:20'";
+        assert_eq!(number(&ctx, sql).await, 2.0);
+        assert_eq!(scan_rows(&ctx, sql).await, 2);
     }
 }
