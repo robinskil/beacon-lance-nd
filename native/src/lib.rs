@@ -5,6 +5,7 @@ mod filter;
 mod fixture;
 mod flatten;
 mod schema;
+mod shard;
 mod stream;
 mod table;
 
