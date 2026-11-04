@@ -19,7 +19,12 @@ pub enum Column {
     Attribute(String),
     /// A key of the `attrs` of a variable.
     VariableAttribute { variable: String, key: String },
+    /// The shard name of a row in a sharded table.
+    Shard,
 }
+
+/// The name of the shard column of a sharded table.
+pub const SHARD_COLUMN: &str = "__shard";
 
 impl Column {
     /// The column name in the table.
@@ -28,6 +33,7 @@ impl Column {
             Column::Variable(name) => name.clone(),
             Column::Attribute(key) => format!(".{key}"),
             Column::VariableAttribute { variable, key } => format!("{variable}.{key}"),
+            Column::Shard => SHARD_COLUMN.to_string(),
         }
     }
 }
@@ -100,7 +106,7 @@ pub fn merge_schemas(
     let group = |column: &Column| match column {
         Column::Variable(_) => 0,
         Column::VariableAttribute { .. } => 1,
-        Column::Attribute(_) => 2,
+        Column::Attribute(_) | Column::Shard => 2,
     };
     for (shard, schema, columns) in shards {
         for (field, column) in schema.fields().iter().zip(columns) {

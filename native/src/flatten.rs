@@ -11,11 +11,12 @@ use nd_arrow_array::{Dimension, Dimensions, NdArrowArray, NdRecordBatch};
 use crate::schema::Column;
 
 /// The flat rows of `row` for the projected `schema` and `columns`, in batches of at most
-/// `batch_size` rows. See [`grid`] for the grid.
+/// `batch_size` rows. `shard` is the value of a [`Column::Shard`]. See [`grid`] for the grid.
 pub fn flatten(
     row: &NdRecordBatch,
     schema: &SchemaRef,
     columns: &[Column],
+    shard: &str,
     batch_size: usize,
 ) -> Result<Vec<RecordBatch>> {
     let grid = grid(row, columns)?;
@@ -24,7 +25,7 @@ pub fn flatten(
         .fields()
         .iter()
         .zip(columns)
-        .map(|(field, column)| flat_column(row, &grid, field, column, cells))
+        .map(|(field, column)| flat_column(row, &grid, field, column, shard, cells))
         .collect::<Result<Vec<_>>>()?;
     let options = RecordBatchOptions::new().with_row_count(Some(cells));
     let full = RecordBatch::try_new_with_options(schema.clone(), arrays, &options)?;
@@ -104,6 +105,7 @@ fn flat_column(
     grid: &Dimensions,
     field: &Field,
     column: &Column,
+    shard: &str,
     cells: usize,
 ) -> Result<ArrayRef> {
     let array = match column {
@@ -115,6 +117,7 @@ fn flat_column(
                 .clone(),
             None => return Ok(new_null_array(field.data_type(), cells)),
         },
+        Column::Shard => ScalarValue::Utf8(Some(shard.to_string())).to_array_of_size(cells)?,
         Column::Attribute(key) => match row.attributes().get(key) {
             Some(value) => ScalarValue::try_from_array(value, 0)?.to_array_of_size(cells)?,
             None => return Ok(new_null_array(field.data_type(), cells)),
@@ -158,7 +161,7 @@ mod tests {
         let fields = names.iter().map(|name| {
             let data_type = match *name {
                 "x" | "y" => DataType::Float64,
-                ".id" | "temperature.units" => DataType::Utf8,
+                ".id" | "temperature.units" | "__shard" => DataType::Utf8,
                 _ => DataType::Float32,
             };
             Field::new(*name, data_type, true)
@@ -167,6 +170,7 @@ mod tests {
             .iter()
             .map(|name| match *name {
                 ".id" => Column::Attribute("id".into()),
+                "__shard" => Column::Shard,
                 "temperature.units" => Column::VariableAttribute {
                     variable: "temperature".into(),
                     key: "units".into(),
@@ -179,7 +183,7 @@ mod tests {
 
     fn run(row: &NdRecordBatch, names: &[&str], batch_size: usize) -> Vec<RecordBatch> {
         let (schema, columns) = projection(names);
-        flatten(row, &schema, &columns, batch_size).unwrap()
+        flatten(row, &schema, &columns, "a.lance", batch_size).unwrap()
     }
 
     fn one(row: &NdRecordBatch, names: &[&str]) -> RecordBatch {
@@ -272,7 +276,7 @@ mod tests {
     #[test]
     fn different_grids_are_an_error() {
         let (schema, columns) = projection(&["x", "y"]);
-        let error = flatten(&row0(), &schema, &columns, 8192)
+        let error = flatten(&row0(), &schema, &columns, "a.lance", 8192)
             .unwrap_err()
             .to_string();
         assert!(error.contains("no common grid"), "{error}");
@@ -301,5 +305,23 @@ mod tests {
         let batch = one(&row1(), &["pressure", "temperature.units"]);
         assert_eq!(batch.num_rows(), 3);
         assert_eq!(batch.column(1).null_count(), 3);
+    }
+
+    #[test]
+    fn shard_column_repeats() {
+        let batch = one(&row0(), &["x", "__shard"]);
+        assert_eq!(batch.num_rows(), 3);
+        let shard = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(shard.iter().all(|v| v == Some("a.lance")));
+    }
+
+    #[test]
+    fn shard_column_does_not_add_to_the_grid() {
+        let batch = one(&row0(), &["__shard"]);
+        assert_eq!(batch.num_rows(), 1);
     }
 }

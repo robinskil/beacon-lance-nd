@@ -68,7 +68,9 @@ impl PartitionStream for LanceNdPartition {
         .try_flatten();
         let flat_schema = Arc::clone(&schema);
         let batches = rows
-            .map(move |row| row.and_then(|row| flatten(&row, &flat_schema, &columns, batch_size)))
+            .map(move |row| {
+                row.and_then(|row| flatten(&row, &flat_schema, &columns, "", batch_size))
+            })
             .map_ok(|batches| stream::iter(batches.into_iter().map(Ok)))
             .try_flatten();
         Box::pin(RecordBatchStreamAdapter::new(schema, batches))
@@ -83,7 +85,7 @@ fn variables_to_read(columns: &[Column]) -> Vec<String> {
         let name = match column {
             Column::Variable(name) => name,
             Column::VariableAttribute { variable, .. } => variable,
-            Column::Attribute(_) => continue,
+            Column::Attribute(_) | Column::Shard => continue,
         };
         if !read.contains(name) {
             read.push(name.clone());

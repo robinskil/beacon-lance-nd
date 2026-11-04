@@ -20,8 +20,12 @@ pub fn to_lance(expr: &Expr, columns: &[Column]) -> Option<Expr> {
     let expr = expr
         .clone()
         .transform(|e| match e {
-            Expr::Column(column) => match columns.iter().find(|c| c.name() == column.name) {
-                Some(source) => Ok(Transformed::yes(lance_path(source))),
+            Expr::Column(column) => match columns
+                .iter()
+                .find(|c| c.name() == column.name)
+                .and_then(lance_path)
+            {
+                Some(path) => Ok(Transformed::yes(path)),
                 None => {
                     known = false;
                     Ok(Transformed::no(Expr::Column(column)))
@@ -34,15 +38,17 @@ pub fn to_lance(expr: &Expr, columns: &[Column]) -> Option<Expr> {
     known.then_some(expr)
 }
 
-/// The Lance column path of a table column.
-fn lance_path(column: &Column) -> Expr {
+/// The Lance column path of a table column, or `None` for a column that Lance does not store.
+fn lance_path(column: &Column) -> Option<Expr> {
     let root = |name: &str| Expr::Column(DfColumn::new_unqualified(name));
     match column {
-        Column::Variable(name) => get_field(root(name), VALUES_FIELD),
-        Column::Attribute(key) => get_field(root(GLOBAL_ATTRIBUTES_FIELD), key.as_str()),
-        Column::VariableAttribute { variable, key } => {
-            get_field(get_field(root(variable), ATTRS_FIELD), key.as_str())
-        }
+        Column::Variable(name) => Some(get_field(root(name), VALUES_FIELD)),
+        Column::Attribute(key) => Some(get_field(root(GLOBAL_ATTRIBUTES_FIELD), key.as_str())),
+        Column::VariableAttribute { variable, key } => Some(get_field(
+            get_field(root(variable), ATTRS_FIELD),
+            key.as_str(),
+        )),
+        Column::Shard => None,
     }
 }
 
@@ -185,5 +191,15 @@ mod tests {
     fn arithmetic_is_not_pushed() {
         let expr = (c("temperature") + lit(1.0)).gt(lit(5.0));
         assert_eq!(lance(expr), None);
+    }
+
+    #[test]
+    fn shard_filter_is_not_for_lance() {
+        let mut columns = columns();
+        columns.push(Column::Shard);
+        let expr = c("__shard").eq(lit("a.lance"));
+        assert_eq!(to_lance(&expr, &columns), None);
+        let mixed = c("__shard").eq(lit("a.lance")).or(c(".id").eq(lit("a")));
+        assert_eq!(to_lance(&mixed, &columns), None);
     }
 }
