@@ -79,9 +79,11 @@ fn read_part(
         Ok::<_, DataFusionError>(rows.map_err(external))
     })
     .try_flatten();
+    let shard = Arc::clone(&name);
     rows.map(move |row| row.and_then(|row| flatten(&row, &schema, &columns, &name, batch_size)))
         .map_ok(|batches| stream::iter(batches.into_iter().map(Ok)))
         .try_flatten()
+        .map_err(move |e: DataFusionError| e.context(format!("lance-nd table {shard}")))
         .boxed()
 }
 

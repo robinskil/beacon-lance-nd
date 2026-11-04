@@ -60,7 +60,7 @@ pub async fn expand(
     if !has_wildcard(pattern) {
         return Ok(vec![(pattern.to_string(), location.to_string())]);
     }
-    let separator = split.map(|at| &location[at..at + 1]).unwrap_or("/");
+    let separator = split.map(|at| &location[at..at + 1]);
     let parent = parent.trim_end_matches(['/', '\\']);
     let params = ObjectStoreParams {
         storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
@@ -88,10 +88,19 @@ pub async fn expand(
     Ok(names
         .into_iter()
         .map(|name| {
-            let uri = format!("{parent}{separator}{name}");
+            let uri = shard_uri(separator, parent, &name);
             (name, uri)
         })
         .collect())
+}
+
+/// The URI of the shard `name` in `parent`. `separator` is the separator of the LOCATION, or
+/// `None` for a LOCATION without one, so a relative pattern gives a relative URI.
+fn shard_uri(separator: Option<&str>, parent: &str, name: &str) -> String {
+    match separator {
+        Some(separator) => format!("{parent}{separator}{name}"),
+        None => name.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -183,5 +192,19 @@ mod tests {
                 found[1]
             );
         }
+    }
+
+    #[test]
+    fn shard_uri_keeps_the_location_form() {
+        assert_eq!(shard_uri(None, "", "a.lance"), "a.lance");
+        assert_eq!(shard_uri(Some("/"), "", "a.lance"), "/a.lance");
+        assert_eq!(
+            shard_uri(Some("/"), "s3://bucket/argo", "a.lance"),
+            "s3://bucket/argo/a.lance"
+        );
+        assert_eq!(
+            shard_uri(Some("\\"), "C:\\data", "a.lance"),
+            "C:\\data\\a.lance"
+        );
     }
 }

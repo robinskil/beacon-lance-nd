@@ -174,7 +174,11 @@ impl TableProvider for LanceNdTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let shards = selected(&self.shards, &shard_filter(filters))?;
+        // In a table without shards, `__shard` can be an ordinary variable.
+        let shards = match self.columns.contains(&Column::Shard) {
+            true => selected(&self.shards, &shard_filter(filters))?,
+            false => self.shards.iter().collect(),
+        };
         let uris: Vec<String> = shards.iter().map(|shard| shard.uri.clone()).collect();
         let datasets: Vec<Arc<Dataset>> = stream::iter(uris)
             .map(|uri| {
@@ -972,6 +976,41 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
+        assert!(error.contains("a.lance"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn one_location_filters_a_variable_named_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let values = Arc::new(
+            beacon_plugin_sdk::datafusion::arrow::array::Float64Array::from(vec![1.0, 0.0]),
+        );
+        let shard =
+            NdArrowArray::try_new(values, Dimensions::try_new([("n", 2)]).unwrap()).unwrap();
+        let uri = write_rows(dir.path(), vec![row(vec![("__shard", shard)], "z")]).await;
+        let ctx = shard_table(&uri, "").await;
+        let sql = r#"SELECT count(*) FROM t WHERE "__shard" > 0.5"#;
+        assert_eq!(number(&ctx, sql).await, 1.0);
+    }
+
+    #[tokio::test]
+    async fn read_error_names_the_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = shard_table(
+            &write_shards(dir.path()).await,
+            "OPTIONS ('partitions' '1')",
+        )
+        .await;
+        // x and y have no common grid in row 0 of a.lance.
+        let error = ctx
+            .sql(r#"SELECT x, y FROM t WHERE "__shard" = 'a.lance'"#)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no common grid"), "{error}");
         assert!(error.contains("a.lance"), "{error}");
     }
 }
