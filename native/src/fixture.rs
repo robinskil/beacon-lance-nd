@@ -93,7 +93,8 @@ pub async fn write_table(uri: &str, rows: Vec<NdRecordBatch>, stats: bool) {
             stats,
             ..WriteOptions::default()
         };
-        lance_nd::write(uri, stream::iter([Ok(row)]), &options)
+        // Boxed: the write future is too deep for the default query depth of the compiler.
+        Box::pin(lance_nd::write(uri, stream::iter([Ok(row)]), &options))
             .await
             .unwrap();
     }
