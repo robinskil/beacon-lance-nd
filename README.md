@@ -82,6 +82,42 @@ Frequent keys:
 
 See [object_store](https://docs.rs/object_store/0.13.2/object_store/) for all keys.
 
+### Shards
+
+A wildcard in the last path segment of `LOCATION` reads many lance-nd tables as one table. Each matching table is a shard.
+
+```sql
+-- Each directory in /data/argo that ends in .lance is a shard.
+CREATE EXTERNAL TABLE argo STORED AS lance_nd LOCATION '/data/argo/*.lance';
+
+-- Object stores work the same. The storage options apply to the listing and to each shard.
+CREATE EXTERNAL TABLE argo STORED AS lance_nd LOCATION 's3://bucket/argo/dac_*.lance'
+OPTIONS ('aws_region' 'eu-west-1');
+
+-- __shard is the last path segment of the shard.
+SELECT "__shard", count(*) AS datasets FROM argo GROUP BY 1;
+
+-- A filter on __shard alone selects shards. The scan does not open the other shards.
+SELECT avg("TEMP") FROM argo
+WHERE "__shard" IN ('aoml.lance', 'coriolis.lance') AND "PRES" < 100;
+```
+
+`*` matches any run of characters, also none. `?` matches one character.
+Shards let each writer write its own table, for example one table for each data center, with no commit conflicts.
+
+| Case | Behavior |
+| --- | --- |
+| `LOCATION` without `*` or `?` | One table. No `__shard` column. |
+| `*` or `?` in a segment before the last | `CREATE` fails. A wildcard is allowed in the last path segment only. |
+| No entry matches | `CREATE` fails. |
+| An entry matches but is not a lance-nd table | `CREATE` fails and names that entry. |
+| A column in some shards only | The column is in the table. It is null for the rows of the other shards. |
+| Same column name with different types in two shards | `CREATE` fails and names the column, both shards and both types. |
+| A variable named `__shard` in a shard | `CREATE` fails. `__shard` is reserved in a sharded table. |
+| A filter uses a column that a shard does not have | That filter does not go to Lance for that shard. Beacon applies it on the flat rows. |
+| A shard is gone after `CREATE` | A query that reads the shard fails and names it. |
+| `partitions` option | The plugin divides the fragments of all shards between the partitions. |
+
 ### Columns
 
 The plugin reads the columns from the table. Do not give a column list.
@@ -188,12 +224,13 @@ CREATE EXTERNAL TABLE obs STORED AS lance_nd LOCATION '/data/obs.lance' OPTIONS 
 ### Table versions
 
 Each query reads the latest version of the table.
-`CREATE` reads the columns one time. To see new variables or attribute keys, use `DROP TABLE` and `CREATE` again.
+`CREATE` reads the columns and the list of shards one time. To see new variables, attribute keys or shards, use `DROP TABLE` and `CREATE` again.
 
 ## Limits
 
 - The plugin reads lance-nd tables. It does not write them. `INSERT INTO` and `COPY TO` are not available.
 - The plugin keeps the selected variables of one lance-nd row in memory after it flattens the row. Large rows need much memory.
+- Each query opens each selected shard. Thousands of shards on an object store make each query slower.
 - A query reads the selected variables of each row. An attribute column of a variable, for example `"sst.units"`, also reads the values of that variable.
 
 ## Build and test
