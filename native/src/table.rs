@@ -9,16 +9,19 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use beacon_plugin_sdk::datafusion::arrow::array::{Array, AsArray, RecordBatch, StringArray};
 use beacon_plugin_sdk::datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use beacon_plugin_sdk::datafusion::catalog::{Session, TableProvider, TableProviderFactory};
+use beacon_plugin_sdk::datafusion::common::tree_node::{Transformed, TreeNode};
 use beacon_plugin_sdk::datafusion::common::{
-    DataFusionError, Result, plan_datafusion_err, plan_err,
+    Column as DfColumn, DFSchema, DataFusionError, Result, plan_datafusion_err, plan_err,
 };
 use beacon_plugin_sdk::datafusion::datasource::TableType as DfTableType;
+use beacon_plugin_sdk::datafusion::logical_expr::execution_props::ExecutionProps;
 use beacon_plugin_sdk::datafusion::logical_expr::{
     CreateExternalTable, Expr, TableProviderFilterPushDown,
 };
-use beacon_plugin_sdk::datafusion::physical_expr::LexOrdering;
+use beacon_plugin_sdk::datafusion::physical_expr::{LexOrdering, create_physical_expr};
 use beacon_plugin_sdk::datafusion::physical_plan::ExecutionPlan;
 use beacon_plugin_sdk::datafusion::physical_plan::streaming::{
     PartitionStream, StreamingTableExec,
@@ -151,10 +154,13 @@ impl TableProvider for LanceNdTable {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
-        // DataFusion applies each filter again, so Lance may keep extra rows.
+        let sharded = self.columns.contains(&Column::Shard);
+        // DataFusion applies each Inexact filter again, so Lance may keep extra rows.
         Ok(filters
             .iter()
             .map(|f| match to_lance(f, &self.columns) {
+                // All rows of a shard have the same `__shard`, so the shard selection is exact.
+                None if sharded && on_shard_only(f) => TableProviderFilterPushDown::Exact,
                 Some(_) => TableProviderFilterPushDown::Inexact,
                 None => TableProviderFilterPushDown::Unsupported,
             })
@@ -168,7 +174,8 @@ impl TableProvider for LanceNdTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let uris: Vec<String> = self.shards.iter().map(|shard| shard.uri.clone()).collect();
+        let shards = selected(&self.shards, &shard_filter(filters))?;
+        let uris: Vec<String> = shards.iter().map(|shard| shard.uri.clone()).collect();
         let datasets: Vec<Arc<Dataset>> = stream::iter(uris)
             .map(|uri| {
                 let storage = self.storage.clone();
@@ -185,8 +192,7 @@ impl TableProvider for LanceNdTable {
             None => (Arc::clone(&self.schema), Arc::clone(&self.columns)),
         };
         let read = variables_to_read(&columns);
-        let parts: Vec<ShardPart> = self
-            .shards
+        let parts: Vec<ShardPart> = shards
             .iter()
             .zip(&datasets)
             .map(|(shard, dataset)| ShardPart {
@@ -248,6 +254,53 @@ impl TableProvider for LanceNdTable {
         )?;
         Ok(Arc::new(exec))
     }
+}
+
+/// `true` when `expr` uses columns, and only the column `__shard`.
+fn on_shard_only(expr: &Expr) -> bool {
+    let columns = expr.column_refs();
+    !columns.is_empty() && columns.iter().all(|c| c.name == SHARD_COLUMN)
+}
+
+/// The filters that use only the column `__shard`.
+fn shard_filter(filters: &[Expr]) -> Vec<&Expr> {
+    filters.iter().filter(|f| on_shard_only(f)).collect()
+}
+
+/// The shards whose name makes each of `filters` true. A null result skips the shard.
+fn selected<'a>(shards: &'a [Shard], filters: &[&Expr]) -> Result<Vec<&'a Shard>> {
+    if filters.is_empty() {
+        return Ok(shards.iter().collect());
+    }
+    let schema = Schema::new(vec![Field::new(SHARD_COLUMN, DataType::Utf8, false)]);
+    let names = StringArray::from_iter_values(shards.iter().map(|s| s.name.as_str()));
+    let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(names)])?;
+    let df_schema = DFSchema::try_from(schema)?;
+    let props = ExecutionProps::new();
+    let mut keep = vec![true; shards.len()];
+    for filter in filters {
+        let filter = (*filter)
+            .clone()
+            .transform(|e| match e {
+                Expr::Column(c) => Ok(Transformed::yes(Expr::Column(DfColumn::new_unqualified(
+                    c.name,
+                )))),
+                e => Ok(Transformed::no(e)),
+            })?
+            .data;
+        let result = create_physical_expr(&filter, &df_schema, &props)?
+            .evaluate(&batch)?
+            .into_array(batch.num_rows())?;
+        let result = result.as_boolean();
+        for (index, kept) in keep.iter_mut().enumerate() {
+            *kept &= result.is_valid(index) && result.value(index);
+        }
+    }
+    Ok(shards
+        .iter()
+        .zip(keep)
+        .filter_map(|(shard, kept)| kept.then_some(shard))
+        .collect())
 }
 
 /// `items` round robin over at most `count` groups, each group sorted by shard. Always at least
@@ -882,5 +935,43 @@ mod tests {
         let ctx = table(&dir, "").await;
         let schema = ctx.table("t").await.unwrap().schema().as_arrow().clone();
         assert!(schema.field_with_name("__shard").is_err());
+    }
+
+    #[tokio::test]
+    async fn shard_filter_selects_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = shard_table(&write_shards(dir.path()).await, "").await;
+        let only_b = r#"SELECT count(*) FROM t WHERE "__shard" = 'b.lance'"#;
+        assert_eq!(scan_rows(&ctx, only_b).await, 1);
+        assert_eq!(number(&ctx, only_b).await, 1.0);
+        let like_a = r#"SELECT count(*) FROM t WHERE "__shard" LIKE 'a%'"#;
+        assert_eq!(number(&ctx, like_a).await, 2.0);
+        let both = r#"SELECT count(*) FROM t WHERE "__shard" IN ('a.lance', 'b.lance')"#;
+        assert_eq!(number(&ctx, both).await, 3.0);
+    }
+
+    #[tokio::test]
+    async fn shard_filter_skips_deleted_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = shard_table(&write_shards(dir.path()).await, "").await;
+        std::fs::remove_dir_all(dir.path().join("a.lance")).unwrap();
+        let sql = r#"SELECT count(*) FROM t WHERE "__shard" = 'b.lance'"#;
+        assert_eq!(number(&ctx, sql).await, 1.0);
+    }
+
+    #[tokio::test]
+    async fn deleted_shard_names_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = shard_table(&write_shards(dir.path()).await, "").await;
+        std::fs::remove_dir_all(dir.path().join("a.lance")).unwrap();
+        let error = ctx
+            .sql("SELECT count(*) FROM t")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("a.lance"), "{error}");
     }
 }
