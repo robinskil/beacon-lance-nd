@@ -3765,7 +3765,8 @@ dependencies = [
 [[package]]
 name = "lance-nd"
 version = "0.1.0"
-source = "git+https://github.com/robinskil/lance-nd?rev=b98f65a0976b07be21374f891ccbfa17e943c668#b98f65a0976b07be21374f891ccbfa17e943c668"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3579f49a46133600275ca13711e77d1ff78e269efdd82a004a757fd25912deab"
 dependencies = [
  "arrow",
  "chrono",
@@ -3776,6 +3777,7 @@ dependencies = [
  "nd-arrow-array",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -4209,7 +4211,8 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 [[package]]
 name = "nd-arrow-array"
 version = "0.5.0"
-source = "git+https://github.com/robinskil/nd-arrow-array#edbd1eb190e317e086acd5729a6be2df01b346ca"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97f6205303ae82a5bf14e0f889f8d675377d296a6590305111623ed0ef6e54a1"
 dependencies = [
  "arrow",
  "arrow-schema",

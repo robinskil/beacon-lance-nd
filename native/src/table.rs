@@ -494,7 +494,8 @@ mod tests {
     #[tokio::test]
     async fn different_grids_are_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = table(&dir, "").await;
+        // One partition reads row 0 first, so the error names its grid.
+        let ctx = table(&dir, "OPTIONS ('partitions' '1')").await;
         let error = ctx
             .sql("SELECT x, y FROM t")
             .await

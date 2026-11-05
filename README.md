@@ -252,6 +252,7 @@ Each query reads the latest version of the table.
 ## Limits
 
 - The plugin reads lance-nd tables. It does not write them. `INSERT INTO` and `COPY TO` are not available.
+- The plugin reads lance-nd tables of format 1: tables that lance-nd 0.1.0 or later wrote. An older table gives the error `the table has no lance_nd:format key`. Write such a table again with lance-nd 0.1.0 or later.
 - The plugin keeps the selected variables of one lance-nd row in memory after it flattens the row. Large rows need much memory.
 - Each query opens each selected shard. Thousands of shards on an object store make each query slower.
 - A query reads the selected variables of each row. An attribute column of a variable, for example `"sst.units"`, also reads the values of that variable.
